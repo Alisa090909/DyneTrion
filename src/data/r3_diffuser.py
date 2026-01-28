@@ -103,17 +103,50 @@ class R3Diffuser:
     def score_scaling(self, t: float):
         return 1 / np.sqrt(self.conditional_var(t))
 
-    def reverse(
-            self,
-            *,
-            x_t: np.ndarray,
-            score_t: np.ndarray,
-            t: float,
-            dt: float,
-            mask: np.ndarray=None,
-            center: bool=True,
-            noise_scale: float=1.0,
-        ):
+    # def reverse(
+    #         self,
+    #         *,
+    #         x_t: np.ndarray,
+    #         score_t: np.ndarray,
+    #         t: float,
+    #         dt: float,
+    #         mask: np.ndarray=None,
+    #         center: bool=True,
+    #         noise_scale: float=1.0,
+    #     ):
+    #     """Simulates the reverse SDE for 1 step
+
+    #     Args:
+    #         x_t: [..., 3] current positions at time t in angstroms.
+    #         score_t: [..., 3] rotation score at time t.
+    #         t: continuous time in [0, 1].
+    #         dt: continuous step size in [0, 1].
+    #         mask: True indicates which residues to diffuse.
+
+    #     Returns:
+    #         [..., 3] positions at next step t-1.
+    #     """
+    #     if not np.isscalar(t):
+    #         raise ValueError(f'{t} must be a scalar.')
+    #     x_t = self._scale(x_t)
+    #     g_t = self.diffusion_coef(t)
+    #     f_t = self.drift_coef(x_t, t)
+    #     z = noise_scale * np.random.normal(size=score_t.shape)
+    #     perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(dt) * z
+
+    #     if mask is not None:
+    #         perturb *= mask[..., None]
+    #     else:
+    #         mask = np.ones(x_t.shape[:-1])
+    #     x_t_1 = x_t - perturb   #(11,135,3)
+    #     if center:
+    #         com = np.sum(x_t_1, axis=-2) / np.sum(mask, axis=-1)[..., None]
+    #         x_t_1 -= com[..., None, :]
+    #     x_t_1 = self._unscale(x_t_1)
+    #     return x_t_1
+    
+    # 去掉numpy，在GPU上运行
+    def reverse(self, *, x_t, score_t, t, dt, mask=None, center=True, noise_scale=1.0):
         """Simulates the reverse SDE for 1 step
 
         Args:
@@ -126,23 +159,37 @@ class R3Diffuser:
         Returns:
             [..., 3] positions at next step t-1.
         """
-        if not np.isscalar(t):
-            raise ValueError(f'{t} must be a scalar.')
-        x_t = self._scale(x_t)
-        g_t = self.diffusion_coef(t)
-        f_t = self.drift_coef(x_t, t)
-        z = noise_scale * np.random.normal(size=score_t.shape)
-        perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(dt) * z
+        if not torch.is_tensor(x_t):
+            x_t = torch.tensor(x_t)
+        device = x_t.device
+        
+        x_t = x_t * self._r3_conf.coordinate_scaling
+        
+        b_t = self.min_b + t*(self.max_b - self.min_b)
+        g_t = torch.sqrt(torch.tensor(b_t,device=device))
+        f_t = -1/2 * b_t * x_t
+        
+        # 生成噪声（直接在 GPU 上生成）
+        z = noise_scale * torch.randn_like(score_t)
+        
+        # 计算扰动
+        perturb = (f_t - g_t**2 * score_t) * dt + g_t * torch.sqrt(torch.tensor(dt, device=device)) * z
 
         if mask is not None:
             perturb *= mask[..., None]
         else:
-            mask = np.ones(x_t.shape[:-1])
+            mask = torch.ones(x_t.shape[:-1], device=device)
+            
         x_t_1 = x_t - perturb   #(11,135,3)
+        
         if center:
-            com = np.sum(x_t_1, axis=-2) / np.sum(mask, axis=-1)[..., None]
+            # com = np.sum(x_t_1, axis=-2) / np.sum(mask, axis=-1)[..., None]
+            com = torch.sum(x_t_1,dim=-2) / (torch.sum(mask,dim=-1)[..., None]+1e-10)
+            # com = torch.sum(x_t_1, dim=-2) / torch.sum(mask, dim=-1).unsqueeze(-1)
             x_t_1 -= com[..., None, :]
-        x_t_1 = self._unscale(x_t_1)
+    
+        # 反缩放并返回
+        x_t_1 = x_t_1 / self._r3_conf.coordinate_scaling
         return x_t_1
 
     def conditional_var(self, t, use_torch=False):

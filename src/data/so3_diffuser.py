@@ -326,15 +326,45 @@ class SO3Diffuser:
         rot_t = du.compose_rotvec(rot_0.reshape(-1,3), sampled_rots).reshape(rot_0.shape)
         return rot_t, rot_score
 
-    def reverse(
-            self,
-            rot_t: np.ndarray,
-            score_t: np.ndarray,
-            t: float,
-            dt: float,
-            mask: np.ndarray=None,
-            noise_scale: float=1.0,
-            ):
+    # def reverse(
+    #         self,
+    #         rot_t: np.ndarray,
+    #         score_t: np.ndarray,
+    #         t: float,
+    #         dt: float,
+    #         mask: np.ndarray=None,
+    #         noise_scale: float=1.0,
+    #         ):
+    #     """Simulates the reverse SDE for 1 step using the Geodesic random walk.
+
+    #     Args:
+    #         rot_t: [..., 3] current rotations at time t.
+    #         score_t: [..., 3] rotation score at time t.
+    #         t: continuous time in [0, 1].
+    #         dt: continuous step size in [0, 1].
+    #         add_noise: set False to set diffusion coefficent to 0.
+    #         mask: True indicates which residues to diffuse.
+
+    #     Returns:
+    #         [..., 3] rotation vector at next step.
+    #     """
+    #     if not np.isscalar(t): raise ValueError(f'{t} must be a scalar.')
+
+    #     g_t = self.diffusion_coef(t)
+    #     z = noise_scale * np.random.normal(size=score_t.shape)
+    #     perturb = (g_t ** 2) * score_t * dt + g_t * np.sqrt(dt) * z
+
+    #     if mask is not None: perturb *= mask[..., None]
+    #     n_samples = np.cumprod(rot_t.shape[:-1])[-1]
+
+    #     # Right multiply.
+    #     rot_t_1 = du.compose_rotvec(
+    #         rot_t.reshape(n_samples, 3),
+    #         perturb.reshape(n_samples, 3)
+    #     ).reshape(rot_t.shape)
+    #     return rot_t_1
+
+    def reverse(self,rot_t,score_t,t,dt,mask=None,noise_scale=1.0):
         """Simulates the reverse SDE for 1 step using the Geodesic random walk.
 
         Args:
@@ -348,18 +378,21 @@ class SO3Diffuser:
         Returns:
             [..., 3] rotation vector at next step.
         """
-        if not np.isscalar(t): raise ValueError(f'{t} must be a scalar.')
-
-        g_t = self.diffusion_coef(t)
-        z = noise_scale * np.random.normal(size=score_t.shape)
-        perturb = (g_t ** 2) * score_t * dt + g_t * np.sqrt(dt) * z
+        device = rot_t.device
+        
+        sigma_t = torch.log(t * torch.exp(torch.tensor(self.max_sigma, device=device)) + 
+                          (1 - t) * torch.exp(torch.tensor(self.min_sigma, device=device)))
+        g_t = torch.sqrt(2 * (torch.exp(torch.tensor(self.max_sigma, device=device)) - 
+                         torch.exp(torch.tensor(self.min_sigma, device=device))) * sigma_t / torch.exp(sigma_t))
+        # g_t = self.diffusion_coef(t)
+        
+        z = noise_scale * torch.randn_like(score_t)
+        perturb = (g_t ** 2) * score_t * dt + g_t * torch.sqrt(torch.tensor(dt, device=device)) * z
 
         if mask is not None: perturb *= mask[..., None]
         n_samples = np.cumprod(rot_t.shape[:-1])[-1]
 
-        # Right multiply.
-        rot_t_1 = du.compose_rotvec(
-            rot_t.reshape(n_samples, 3),
-            perturb.reshape(n_samples, 3)
-        ).reshape(rot_t.shape)
+        # 旋转复合 (Compose),重写了du.compose_rotvec (torch版)
+        rot_t_1 = du.compose_rotvec(rot_t, perturb) 
+        
         return rot_t_1

@@ -22,9 +22,6 @@ from src.data import utils as du
 import DyneTrion.train_DyneTrion as train_DyneTrion
 
 
-
-
-
 class Evaluator:
     def __init__(
             self,
@@ -86,6 +83,10 @@ class Evaluator:
 
         self.model = self.model.to(self.device)
         self.model.eval()
+        
+        print(">>> Compiling the main model... This may take a few minutes.")
+        self.model = torch.compile(self.model) 
+        
         self.diffuser = self.exp.diffuser
 
         self._log.info(f"Loading model Successfully from {self._weights_path}!!!")
@@ -137,10 +138,11 @@ class Evaluator:
                 noise_scale=self.exp._exp_conf.noise_scale,
             )
 
-
-
 @hydra.main(version_base=None, config_path="./config", config_name="eval_DyneTrion")
 def run(conf: DictConfig) -> None:
+    
+    torch.set_float32_matmul_precision('high')
+    
     # Read model checkpoint.
     print('Starting inference')
     start_time = time.time()

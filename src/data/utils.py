@@ -181,12 +181,12 @@ def rigid_frames_from_atom_14(atom_14):
         n_atoms, ca_atoms, c_atoms
     )
 
-def compose_rotvec(r1, r2):
-    """Compose two rotation euler vectors."""
-    R1 = rotvec_to_matrix(r1)
-    R2 = rotvec_to_matrix(r2)
-    cR = np.einsum('...ij,...jk->...ik', R1, R2)
-    return matrix_to_rotvec(cR)
+# def compose_rotvec(r1, r2):
+#     """Compose two rotation euler vectors."""
+#     R1 = rotvec_to_matrix(r1)
+#     R2 = rotvec_to_matrix(r2)
+#     cR = np.einsum('...ij,...jk->...ik', R1, R2)
+#     return matrix_to_rotvec(cR)
 
 def rotvec_to_matrix(rotvec):
     return Rotation.from_rotvec(rotvec).as_matrix()
@@ -613,3 +613,65 @@ def save_fasta(
     with open(file_path, 'w') as f:
         for x,y in zip(seq_names, pred_seqs):
             f.write(f'>{x}\n{y}\n')
+
+
+# 增加一个将旋转向量转为四元数的 Torch 函数 (W-first: [w, x, y, z])
+def torch_rotvec_to_quat(rotvec):
+    """旋转向量 -> 四元数 [w, x, y, z] (Pure Torch)"""
+    angle = torch.norm(rotvec, dim=-1, keepdim=True)
+    mask = angle > 1e-6
+    axis = torch.where(mask, rotvec / (angle + 1e-8), torch.zeros_like(rotvec))
+    
+    half_angle = angle * 0.5
+    w = torch.cos(half_angle)
+    xyz = torch.sin(half_angle) * axis
+    return torch.cat([w, xyz], dim=-1)
+
+# 增加一个四元数乘法函数 (针对 w-first 格式)
+def torch_quat_multiply(q1, q2):
+    """两个四元数复合 q1 * q2 (Pure Torch)"""
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+    
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return torch.stack([w, x, y, z], dim=-1)
+
+def torch_rotvec_to_matrix(rotvec):
+    """旋转向量 -> 旋转矩阵 (Pure Torch)"""
+    if not torch.is_tensor(rotvec):
+        rotvec = torch.from_numpy(rotvec).float()
+    
+    theta = torch.norm(rotvec, dim=-1, keepdim=True)
+    mask = theta > 1e-6
+    r = torch.where(mask, rotvec / (theta + 1e-8), torch.zeros_like(rotvec))
+    r_x, r_y, r_z = r[..., 0], r[..., 1], r[..., 2]
+    K = torch.stack([
+        torch.stack([torch.zeros_like(r_x), -r_z, r_y], dim=-1),
+        torch.stack([r_z, torch.zeros_like(r_x), -r_x], dim=-1),
+        torch.stack([-r_y, r_x, torch.zeros_like(r_x)], dim=-1)
+    ], dim=-2)
+    I = torch.eye(3, device=rotvec.device)
+    return I + torch.sin(theta)[..., None] * K + (1.0 - torch.cos(theta))[..., None] * torch.matmul(K, K)
+
+# 重写 compose_rotvec，支持 Torch 且在 GPU 运行
+def compose_rotvec(r1, r2):
+    """全 GPU 版：复合两个旋转向量"""
+    
+    is_numpy = isinstance(r1, np.ndarray)
+    if is_numpy:
+        r1 = torch.from_numpy(r1)
+        r2 = torch.from_numpy(r2)
+    
+    # 旋转向量 -> 四元数 -> 四元数相乘 -> 旋转向量. 使用四元数复合，比矩阵乘法更快且更稳定
+    q1 = torch_rotvec_to_quat(r1)
+    q2 = torch_rotvec_to_quat(r2)
+    
+    q_out = torch_quat_multiply(q1, q2)
+    
+    r_out = quat_to_rotvec(q_out)
+    
+    return r_out.cpu().numpy() if is_numpy else r_out

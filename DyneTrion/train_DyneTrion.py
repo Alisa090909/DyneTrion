@@ -793,17 +793,29 @@ class Experiment:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
                     diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
-                    rigids_t = self.diffuser.reverse(
-                        rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
-                        rot_score=du.move_to_np(rot_score),
-                        trans_score=du.move_to_np(trans_score),
-                        diffuse_mask=du.move_to_np(diffuse_mask),
-                        t=t,
-                        dt=dt,
-                        center=center,
-                        noise_scale=noise_scale,
-                        device=device
-                    )
+                    # rigids_t = self.diffuser.reverse(
+                    #     rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
+                    #     rot_score=du.move_to_np(rot_score),
+                    #     trans_score=du.move_to_np(trans_score),
+                    #     diffuse_mask=du.move_to_np(diffuse_mask),
+                    #     t=t,
+                    #     dt=dt,
+                    #     center=center,
+                    #     noise_scale=noise_scale,
+                    #     device=device
+                    # )
+                    with autocast(dtype=torch.bfloat16):
+                        rigids_t = self.diffuser.reverse(
+                            rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
+                            rot_score=model_out['rot_score'], 
+                            trans_score=model_out['trans_score'],
+                            diffuse_mask=sample_feats['res_mask'], # 确保是 Tensor
+                            t=torch.tensor(t, device=device), 
+                            dt=dt,
+                            center=center,
+                            noise_scale=noise_scale,
+                            device=device
+                        )                    
                 else:
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
@@ -1112,46 +1124,46 @@ class Experiment:
 
         # === save GT
         aatype = valid_feats["aatype"][0, 0].cpu().numpy()
-        au.write_prot_to_pdb(
-            prot_pos=valid_feats["atom37_pos"][0].cpu().numpy(),
-            file_path=gt_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
+        # au.write_prot_to_pdb(
+        #     prot_pos=valid_feats["atom37_pos"][0].cpu().numpy(),
+        #     file_path=gt_path,
+        #     aatype=aatype,
+        #     no_indexing=True,
+        #     b_factors=b_factors,
+        # )
 
-        # === save aligned prediction
-        au.write_prot_to_pdb(
-            prot_pos=align_sample.cpu().numpy(),
-            file_path=sample_aligned_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
+        # # === save aligned prediction
+        # au.write_prot_to_pdb(
+        #     prot_pos=align_sample.cpu().numpy(),
+        #     file_path=sample_aligned_path,
+        #     aatype=aatype,
+        #     no_indexing=True,
+        #     b_factors=b_factors,
+        # )
 
         # === save unaligned prediction
-        au.write_prot_to_pdb(
-            prot_pos=sample_out["prot_traj"][0],
-            file_path=sample_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
+        # au.write_prot_to_pdb(
+        #     prot_pos=sample_out["prot_traj"][0],
+        #     file_path=sample_path,
+        #     aatype=aatype,
+        #     no_indexing=True,
+        #     b_factors=b_factors,
+        # )
 
         # === save first_motion
-        au.write_prot_to_pdb(
-            prot_pos=np.concatenate(
-                (
-                    valid_feats["motion_atom37_pos"][0].cpu().numpy(),
-                    valid_feats["ref_atom37_pos"][0].cpu().numpy(),
-                ),
-                axis=0,
-            ),
-            file_path=first_motion_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
+        # au.write_prot_to_pdb(
+        #     prot_pos=np.concatenate(
+        #         (
+        #             valid_feats["motion_atom37_pos"][0].cpu().numpy(),
+        #             valid_feats["ref_atom37_pos"][0].cpu().numpy(),
+        #         ),
+        #         axis=0,
+        #     ),
+        #     file_path=first_motion_path,
+        #     aatype=aatype,
+        #     no_indexing=True,
+        #     b_factors=b_factors,
+        # )
 
         # === save npz if not training
         if not is_training and dirs.get("pred_npz"):
@@ -1364,8 +1376,6 @@ class Experiment:
         valid_feats["rigids_t"] = ref_sample["rigids_t"].to(device)
 
         return valid_feats
-    
-    
     
     def _update_best_model(self, mean_dict: dict, rot_trans_error_mean: dict) -> bool:
         """
