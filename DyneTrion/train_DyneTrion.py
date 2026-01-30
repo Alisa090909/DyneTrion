@@ -26,6 +26,8 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils import data
 import mdtraj as md
+from contextlib import contextmanager
+import torch.cuda.nvtx as nvtx
 
 import swanlab
 from tqdm import tqdm
@@ -48,6 +50,14 @@ from src.toolbox.rot_trans_error import (
     average_quaternion_distances,
     average_translation_distances,
 )
+
+@contextmanager
+def nvtx_range(name):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 class Experiment:
 
@@ -317,7 +327,7 @@ class Experiment:
         #                 state[k] = v.to(device)
 
         self._model.train()
-                    
+        
         (train_loader,valid_loader) = self.create_dataset()
 
         logs = []
@@ -385,7 +395,8 @@ class Experiment:
             if return_logs:
                 global_logs.append(loss)
             for k,v in aux_data.items():
-                log_lossses[k].append(du.move_to_np(v))
+                # log_lossses[k].append(du.move_to_np(v))
+                log_lossses[k].append(v)
             self.trained_steps += 1
 
             if self.trained_steps == 1 or self.trained_steps % self._exp_conf.log_freq == 0:
@@ -770,11 +781,14 @@ class Experiment:
         t_start = time.perf_counter()
         with torch.no_grad():
             # self-condition
+            nvtx.range_push("self_condition")
             if self._model_conf.embed.embed_self_conditioning and self_condition:
                 sample_feats = self._set_t_feats(sample_feats, reverse_steps[0], t_placeholder)
                 sample_feats = self._self_conditioning(sample_feats)
+            nvtx.range_pop()
             for step_idx, t in enumerate(reverse_steps):
                 # model infer
+                nvtx.range_push("model_infer")
                 if t > min_t:
                     sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
                     model_out = self.model(sample_feats, is_training = self._exp_conf.training)
@@ -782,13 +796,16 @@ class Experiment:
                     trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
                     # use CFG inference
+                    nvtx.range_push("cfg_inference")
                     if self._conf.model.cfg_drop_rate > 0.01:
                         model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
                         trans_score_unref = model_out_uncond["trans_score"]
                         rot_score_unref = model_out_uncond["rot_score"]
                         cfg_gamma = self._conf.model.cfg_gamma
                         trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
+                    nvtx.range_pop()
 
+                    nvtx.range_push("update_and_generate")
                     if self._model_conf.embed.embed_self_conditioning:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
@@ -815,15 +832,18 @@ class Experiment:
                             center=center,
                             noise_scale=noise_scale,
                             device=device
-                        )                    
+                        )
+                    nvtx.range_pop()                   
                 else:
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
                 sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
                 infer_end_time = time.time()
+                nvtx.range_pop() 
                 # post process
                 if aux_traj:
-                    all_rigids.append(du.move_to_np(model_out['rigids']))
+                    # all_rigids.append(du.move_to_np(model_out['rigids']))
+                    all_rigids.append(model_out['rigids'])
 
                 gt_trans_0 = sample_feats['rigids_t'][..., 4:]
                 pred_trans_0 = rigid_pred[..., 4:]
@@ -836,11 +856,13 @@ class Experiment:
                         aatypes=sample_feats['aatype'],
                         torsions = angles
                         )[0]
-                    all_bb_prots.append(du.move_to_np(atom37_t))
+                    # all_bb_prots.append(du.move_to_np(atom37_t))
+                    all_bb_prots.append(atom37_t)
         # 
         inference_time = time.perf_counter() - t_start
         print(f"inference_time:{inference_time:.2f} | num_t:{num_t} | noise_scale:{noise_scale}")
-        flip = lambda x: np.flip(np.stack(x), (0,))
+        # flip = lambda x: np.flip(np.stack(x), (0,))
+        flip = lambda x: torch.flip(torch.stack(x), dims=(0,))
         all_bb_prots = flip(all_bb_prots)
         all_rigids = flip(all_rigids)
         ret = {
@@ -1040,7 +1062,8 @@ class Experiment:
             align_metric_list.append((rot, trans))
             aligned = np.dot(pred_traj[frame_idx], rot) + trans
             aligned *= atom37_mask[frame_idx][..., None]  # apply mask
-            align_sample_list.append(torch.from_numpy(aligned))
+            # align_sample_list.append(torch.from_numpy(aligned))
+            align_sample_list.append(aligned)
 
         aligned_sample = torch.stack(align_sample_list)
         return aligned_sample, align_metric_list
@@ -1260,16 +1283,24 @@ class Experiment:
             )
 
         # === Concatenate trajectory and save ===
-        atom_traj = np.concatenate(atom_traj, axis=0)
-        rigid_traj = np.concatenate(rigid_traj, axis=0)
+        # atom_traj = np.concatenate(atom_traj, axis=0)
+        # rigid_traj = np.concatenate(rigid_traj, axis=0)
         
-        au.write_prot_to_pdb(
-            prot_pos=atom_traj,
-            file_path=pdb_path,
-            aatype=aatype[0, 0],
-            no_indexing=True,
-            b_factors=b_factors,
-        )
+        atom_traj = torch.cat(atom_traj, dim=0)
+        rigid_traj = torch.cat(rigid_traj, dim=0)
+        if torch.is_tensor(atom_traj):
+            atom_traj = atom_traj.detach().cpu().numpy()
+        if torch.is_tensor(rigid_traj):
+            rigid_traj = rigid_traj.detach().cpu().numpy()
+        
+        with nvtx_range("PDB_Writing_IO"):
+            au.write_prot_to_pdb(
+                prot_pos=atom_traj,
+                file_path=pdb_path,
+                aatype=aatype[0, 0],
+                no_indexing=True,
+                b_factors=b_factors,
+            )
     def _prepare_init_feats(self, valid_feats, device, frame_time, sample_length):
         """Prepare initial features for inference."""
         res_mask = np.ones((frame_time, sample_length))
@@ -1311,13 +1342,15 @@ class Experiment:
         concat_rigids = torch.cat([
             valid_feats["motion_rigids_0"].to(device),
             valid_feats["ref_rigids_0"].to(device),
-            torch.from_numpy(rigid_pred).to(device).to(valid_feats["motion_rigids_0"].dtype),
+            # torch.from_numpy(rigid_pred).to(device).to(valid_feats["motion_rigids_0"].dtype), #(rigid_pred if torch.is_tensor(rigid_pred) else torch.from_numpy(rigid_pred))
+            rigid_pred.to(device).to(valid_feats["motion_rigids_0"].dtype),
         ], dim=0)
 
         concat_atoms = torch.cat([
             valid_feats["motion_atom37_pos"].to(device),
             valid_feats["ref_atom37_pos"].to(device),
-            torch.from_numpy(atom_pred).to(device).to(valid_feats["motion_atom37_pos"].dtype),
+            # torch.from_numpy(atom_pred).to(device).to(valid_feats["motion_atom37_pos"].dtype),
+            atom_pred.to(device).to(valid_feats["motion_atom37_pos"].dtype),
         ], dim=0)
         if change_ref:
             # valid_feats["ref_rigids_0"] = concat_rigids[-ref_number:]#.unsqueeze(0)

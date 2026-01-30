@@ -166,7 +166,8 @@ class R3Diffuser:
         x_t = x_t * self._r3_conf.coordinate_scaling
         
         b_t = self.min_b + t*(self.max_b - self.min_b)
-        g_t = torch.sqrt(torch.tensor(b_t,device=device))
+        # g_t = torch.sqrt(torch.tensor(b_t,device=device))
+        g_t = torch.sqrt(b_t.detach().to(device))
         f_t = -1/2 * b_t * x_t
         
         # 生成噪声（直接在 GPU 上生成）

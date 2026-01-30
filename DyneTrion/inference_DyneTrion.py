@@ -16,11 +16,20 @@ from omegaconf import DictConfig
 from omegaconf import OmegaConf
 from torch.utils import data
 from typing import Dict
+from contextlib import contextmanager
+import torch.cuda.nvtx as nvtx
 
 from src.data import DyneTrion_data_loader_dynamic
 from src.data import utils as du
 import DyneTrion.train_DyneTrion as train_DyneTrion
 
+@contextmanager
+def nvtx_range(name):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 class Evaluator:
     def __init__(
@@ -84,8 +93,8 @@ class Evaluator:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        print(">>> Compiling the main model... This may take a few minutes.")
-        self.model = torch.compile(self.model) 
+        with nvtx_range("compile-time"):
+            self.model = torch.compile(self.model) 
         
         self.diffuser = self.exp.diffuser
 
@@ -107,9 +116,11 @@ class Evaluator:
         # define data process
         # we need to call the MD simulation to get the data
         # maybe add some func in the dateset class
+        print("开始精准性能采集...")
+        torch.cuda.profiler.start()
         
-        
-        test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
+        with nvtx_range("Data_Loading_And_Parsing"):
+            test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
 
         eval_dir = self._output_dir
         os.makedirs(eval_dir, exist_ok=True)
@@ -128,15 +139,18 @@ class Evaluator:
             valid_feats, pdb_names = test_dataset._get_row(i)
             for k,v in valid_feats.items():
                 valid_feats[k] = v.unsqueeze(0)
-            self.exp._process_one_protein_extrapolation(
-                extrapolation_time,
-                valid_feats,
-                [pdb_names],
-                ref_base_path,
-                pdb_base_path,
-                device=self.device,
-                noise_scale=self.exp._exp_conf.noise_scale,
-            )
+            with nvtx_range(f"process_one_protein_extrapolation"):
+                self.exp._process_one_protein_extrapolation(
+                    extrapolation_time,
+                    valid_feats,
+                    [pdb_names],
+                    ref_base_path,
+                    pdb_base_path,
+                    device=self.device,
+                    noise_scale=self.exp._exp_conf.noise_scale,
+                )
+        torch.cuda.profiler.stop()   # <--- 录制结束
+        print("性能采集结束。")
 
 @hydra.main(version_base=None, config_path="./config", config_name="eval_DyneTrion")
 def run(conf: DictConfig) -> None:
