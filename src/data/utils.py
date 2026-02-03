@@ -654,17 +654,17 @@ def torch_rotvec_to_matrix(rotvec):
         torch.stack([r_z, torch.zeros_like(r_x), -r_x], dim=-1),
         torch.stack([-r_y, r_x, torch.zeros_like(r_x)], dim=-1)
     ], dim=-2)
-    I = torch.eye(3, device=rotvec.device)
+    I = torch.eye(3, device=rotvec.device).view(1,3,3)
     return I + torch.sin(theta)[..., None] * K + (1.0 - torch.cos(theta))[..., None] * torch.matmul(K, K)
 
 # 重写 compose_rotvec，支持 Torch 且在 GPU 运行
 def compose_rotvec(r1, r2):
     """全 GPU 版：复合两个旋转向量"""
     
-    is_numpy = isinstance(r1, np.ndarray)
-    if is_numpy:
-        r1 = torch.from_numpy(r1)
-        r2 = torch.from_numpy(r2)
+    # is_numpy = isinstance(r1, np.ndarray)
+    # if is_numpy:
+    #     r1 = torch.from_numpy(r1)
+    #     r2 = torch.from_numpy(r2)
     
     # 旋转向量 -> 四元数 -> 四元数相乘 -> 旋转向量. 使用四元数复合，比矩阵乘法更快且更稳定
     q1 = torch_rotvec_to_quat(r1)
@@ -672,6 +672,6 @@ def compose_rotvec(r1, r2):
     
     q_out = torch_quat_multiply(q1, q2)
     
-    r_out = quat_to_rotvec(q_out)
+    # r_out = quat_to_rotvec(q_out)
     
-    return r_out.cpu().numpy() if is_numpy else r_out
+    return quat_to_rotvec(q_out)

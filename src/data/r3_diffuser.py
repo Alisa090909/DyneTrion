@@ -24,9 +24,7 @@ class R3Diffuser:
         return x / self._r3_conf.coordinate_scaling
 
     def b_t(self, t):
-        if np.any(t < 0) or np.any(t > 1):
-            raise ValueError(f'Invalid t={t}')
-        return self.min_b + t*(self.max_b - self.min_b)
+        return self.min_b + t * (self.max_b - self.min_b)
 
     def diffusion_coef(self, t):
         """Time-dependent diffusion coefficient."""
@@ -38,9 +36,9 @@ class R3Diffuser:
 
     def sample_ref(self, n_samples: float=1):
         return np.random.normal(size=(n_samples, 3))
-
+    
     def marginal_b_t(self, t):
-        return t*self.min_b + (1/2)*(t**2)*(self.max_b-self.min_b)
+        return t * self.min_b + 0.5 * (t**2) * (self.max_b - self.min_b)
 
     def calc_trans_0(self, score_t, x_t, t, use_torch=True):
         beta_t = self.marginal_b_t(t)
@@ -100,52 +98,12 @@ class R3Diffuser:
         x_t = self._unscale(x_t)
         return x_t, score_t
 
-    def score_scaling(self, t: float):
-        return 1 / np.sqrt(self.conditional_var(t))
-
-    # def reverse(
-    #         self,
-    #         *,
-    #         x_t: np.ndarray,
-    #         score_t: np.ndarray,
-    #         t: float,
-    #         dt: float,
-    #         mask: np.ndarray=None,
-    #         center: bool=True,
-    #         noise_scale: float=1.0,
-    #     ):
-    #     """Simulates the reverse SDE for 1 step
-
-    #     Args:
-    #         x_t: [..., 3] current positions at time t in angstroms.
-    #         score_t: [..., 3] rotation score at time t.
-    #         t: continuous time in [0, 1].
-    #         dt: continuous step size in [0, 1].
-    #         mask: True indicates which residues to diffuse.
-
-    #     Returns:
-    #         [..., 3] positions at next step t-1.
-    #     """
-    #     if not np.isscalar(t):
-    #         raise ValueError(f'{t} must be a scalar.')
-    #     x_t = self._scale(x_t)
-    #     g_t = self.diffusion_coef(t)
-    #     f_t = self.drift_coef(x_t, t)
-    #     z = noise_scale * np.random.normal(size=score_t.shape)
-    #     perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(dt) * z
-
-    #     if mask is not None:
-    #         perturb *= mask[..., None]
-    #     else:
-    #         mask = np.ones(x_t.shape[:-1])
-    #     x_t_1 = x_t - perturb   #(11,135,3)
-    #     if center:
-    #         com = np.sum(x_t_1, axis=-2) / np.sum(mask, axis=-1)[..., None]
-    #         x_t_1 -= com[..., None, :]
-    #     x_t_1 = self._unscale(x_t_1)
-    #     return x_t_1
+    # def score_scaling(self, t: float):
+    #     return 1 / np.sqrt(self.conditional_var(t))
     
-    # 去掉numpy，在GPU上运行
+    def score_scaling(self, t):
+        return 1 / torch.sqrt(self.conditional_var(t, use_torch=True))
+
     def reverse(self, *, x_t, score_t, t, dt, mask=None, center=True, noise_scale=1.0):
         """Simulates the reverse SDE for 1 step
 
@@ -165,16 +123,19 @@ class R3Diffuser:
         
         x_t = x_t * self._r3_conf.coordinate_scaling
         
+        # 预先在外面存好 sqrt_dt_tensor，不要每一步都创建
+        if not hasattr(self, '_sqrt_dt_t'):
+            self._sqrt_dt_t = torch.sqrt(torch.tensor(dt, device=device))
+        
         b_t = self.min_b + t*(self.max_b - self.min_b)
-        # g_t = torch.sqrt(torch.tensor(b_t,device=device))
-        g_t = torch.sqrt(b_t.detach().to(device))
+        g_t = torch.sqrt(b_t)
         f_t = -1/2 * b_t * x_t
         
         # 生成噪声（直接在 GPU 上生成）
         z = noise_scale * torch.randn_like(score_t)
         
         # 计算扰动
-        perturb = (f_t - g_t**2 * score_t) * dt + g_t * torch.sqrt(torch.tensor(dt, device=device)) * z
+        perturb = (f_t - g_t**2 * score_t) * dt + g_t * self._sqrt_dt_t * z
 
         if mask is not None:
             perturb *= mask[..., None]
@@ -184,24 +145,19 @@ class R3Diffuser:
         x_t_1 = x_t - perturb   #(11,135,3)
         
         if center:
-            # com = np.sum(x_t_1, axis=-2) / np.sum(mask, axis=-1)[..., None]
-            com = torch.sum(x_t_1,dim=-2) / (torch.sum(mask,dim=-1)[..., None]+1e-10)
-            # com = torch.sum(x_t_1, dim=-2) / torch.sum(mask, dim=-1).unsqueeze(-1)
-            x_t_1 -= com[..., None, :]
+            mask_sum = torch.sum(mask, dim=-1, keepdim=True)
+            com = torch.sum(x_t_1, dim=-2) / (mask_sum + 1e-10)
+            x_t_1 -= com.unsqueeze(-2) # 自动对齐维度
     
         # 反缩放并返回
-        x_t_1 = x_t_1 / self._r3_conf.coordinate_scaling
-        return x_t_1
+        return x_t_1 / self._r3_conf.coordinate_scaling
 
-    def conditional_var(self, t, use_torch=False):
-        """Conditional variance of p(xt|x0).
-
-        Var[x_t|x_0] = conditional_var(t)*I
-
-        """
-        if use_torch:
-            return 1 - torch.exp(-self.marginal_b_t(t))
-        return 1 - np.exp(-self.marginal_b_t(t))
+    def conditional_var(self, t, use_torch=True):
+        """xt|x0 的条件方差"""
+        # 默认设为 True，强制走 GPU 路径
+        if use_torch or torch.is_tensor(t):
+            return 1.0 - torch.exp(-self.marginal_b_t(t))
+        return 1.0 - np.exp(-self.marginal_b_t(t))
 
     def score(self, x_t, x_0, t, use_torch=False, scale=False):
         if use_torch:

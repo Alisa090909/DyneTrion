@@ -42,7 +42,11 @@ from openfold.utils import rigid_utils as ru
 from openfold.utils.loss import lddt_ca, torsion_angle_loss
 from src.data import DyneTrion_data_loader_dynamic
 from src.analysis import utils as au
-from src.data import se3_diffuser, all_atom
+# from src.data import se3_diffuser, all_atom
+
+from src.data import se3_diffuser
+from src.data import all_atom_zxm as all_atom
+
 from src.data import utils as du
 from src.experiments import utils as eu
 from src.model import diffusion_4d_network_dynamic
@@ -395,7 +399,6 @@ class Experiment:
             if return_logs:
                 global_logs.append(loss)
             for k,v in aux_data.items():
-                # log_lossses[k].append(du.move_to_np(v))
                 log_lossses[k].append(v)
             self.trained_steps += 1
 
@@ -774,7 +777,8 @@ class Experiment:
         if min_t is None:
             min_t = self._data_conf.min_t
         # print("=" * 20, num_t)
-        reverse_steps = np.linspace(min_t, 1.0, num_t)[::-1]
+        # reverse_steps = np.linspace(min_t, 1.0, num_t)[::-1]
+        reverse_steps = torch.linspace(min_t, 1.0, num_t, device=device).flip(dims=(0,))
         dt = 1/num_t
         all_rigids = []
         all_bb_prots = []
@@ -810,24 +814,13 @@ class Experiment:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
                     diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
-                    # rigids_t = self.diffuser.reverse(
-                    #     rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
-                    #     rot_score=du.move_to_np(rot_score),
-                    #     trans_score=du.move_to_np(trans_score),
-                    #     diffuse_mask=du.move_to_np(diffuse_mask),
-                    #     t=t,
-                    #     dt=dt,
-                    #     center=center,
-                    #     noise_scale=noise_scale,
-                    #     device=device
-                    # )
                     with autocast(dtype=torch.bfloat16):
                         rigids_t = self.diffuser.reverse(
                             rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
                             rot_score=model_out['rot_score'], 
                             trans_score=model_out['trans_score'],
                             diffuse_mask=sample_feats['res_mask'], # 确保是 Tensor
-                            t=torch.tensor(t, device=device), 
+                            t=t, 
                             dt=dt,
                             center=center,
                             noise_scale=noise_scale,
@@ -842,7 +835,6 @@ class Experiment:
                 nvtx.range_pop() 
                 # post process
                 if aux_traj:
-                    # all_rigids.append(du.move_to_np(model_out['rigids']))
                     all_rigids.append(model_out['rigids'])
 
                 gt_trans_0 = sample_feats['rigids_t'][..., 4:]
@@ -856,7 +848,6 @@ class Experiment:
                         aatypes=sample_feats['aatype'],
                         torsions = angles
                         )[0]
-                    # all_bb_prots.append(du.move_to_np(atom37_t))
                     all_bb_prots.append(atom37_t)
         # 
         inference_time = time.perf_counter() - t_start
@@ -1147,47 +1138,7 @@ class Experiment:
 
         # === save GT
         aatype = valid_feats["aatype"][0, 0].cpu().numpy()
-        # au.write_prot_to_pdb(
-        #     prot_pos=valid_feats["atom37_pos"][0].cpu().numpy(),
-        #     file_path=gt_path,
-        #     aatype=aatype,
-        #     no_indexing=True,
-        #     b_factors=b_factors,
-        # )
-
-        # # === save aligned prediction
-        # au.write_prot_to_pdb(
-        #     prot_pos=align_sample.cpu().numpy(),
-        #     file_path=sample_aligned_path,
-        #     aatype=aatype,
-        #     no_indexing=True,
-        #     b_factors=b_factors,
-        # )
-
-        # === save unaligned prediction
-        # au.write_prot_to_pdb(
-        #     prot_pos=sample_out["prot_traj"][0],
-        #     file_path=sample_path,
-        #     aatype=aatype,
-        #     no_indexing=True,
-        #     b_factors=b_factors,
-        # )
-
-        # === save first_motion
-        # au.write_prot_to_pdb(
-        #     prot_pos=np.concatenate(
-        #         (
-        #             valid_feats["motion_atom37_pos"][0].cpu().numpy(),
-        #             valid_feats["ref_atom37_pos"][0].cpu().numpy(),
-        #         ),
-        #         axis=0,
-        #     ),
-        #     file_path=first_motion_path,
-        #     aatype=aatype,
-        #     no_indexing=True,
-        #     b_factors=b_factors,
-        # )
-
+        
         # === save npz if not training
         if not is_training and dirs.get("pred_npz"):
 
@@ -1222,6 +1173,8 @@ class Experiment:
         noise_scale=1.0,
     ):
         """Process one protein sequence and perform trajectory extrapolation."""
+        
+        # print(f"================pdb_names:{pdb_names}")
 
         # === Preparation ===
         protein_name = pdb_names[0]
@@ -1236,6 +1189,10 @@ class Experiment:
         if os.path.exists(pdb_path):
             print(f"✅ {protein_name} already existed in: {pdb_path}")
             return 
+        
+        # print(f"DEBUG: rigids_t shape = {valid_feats['rigids_t'].shape}")
+        # print(f"DEBUG: node_repr shape = {valid_feats['node_repr'].shape}")
+        
         # Save reference structure
         ref_all_atom_positions = valid_feats["ref_atom37_pos"][0].cpu().numpy()
         au.write_prot_to_pdb(

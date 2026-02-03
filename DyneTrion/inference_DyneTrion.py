@@ -23,6 +23,33 @@ from src.data import DyneTrion_data_loader_dynamic
 from src.data import utils as du
 import DyneTrion.train_DyneTrion as train_DyneTrion
 
+# def print_data_structure(data, name="root", indent=0):
+#     shift = "    " * indent
+    
+#     # 情况 A: 字典 (最常见，包含各个 Feature)
+#     if isinstance(data, dict):
+#         print(f"{shift}{name} (dict):")
+#         for k, v in data.items():
+#             print_data_structure(v, k, indent + 1)
+            
+#     # 情况 B: 元组或列表 (你的数据外层包装)
+#     elif isinstance(data, (list, tuple)):
+#         print(f"{shift}{name} ({type(data).__name__}) length={len(data)}:")
+#         for i, v in enumerate(data):
+#             print_data_structure(v, f"Index {i}", indent + 1)
+            
+#     # 情况 C: PyTorch Tensor (这是你最关心的维度)
+#     elif torch.is_tensor(data):
+#         print(f"{shift}{name}: Tensor shape={list(data.shape)}, dtype={data.dtype}, device={data.device}")
+        
+#     # 情况 D: 普通 Python 类型 (String, int, float)
+#     else:
+#         # 如果字符串太长则截断
+#         val_str = str(data)
+#         if len(val_str) > 50:
+#             val_str = val_str[:47] + "..."
+#         print(f"{shift}{name}: {type(data).__name__} = {val_str}")
+
 @contextmanager
 def nvtx_range(name):
     torch.cuda.nvtx.range_push(name)
@@ -63,8 +90,6 @@ class Evaluator:
         self._log.info(f'Saving results to {self._output_dir}')
         # Load models and experiment
         self._load_ckpt(conf_overrides)
-
-
         
 
     def _load_ckpt(self, conf_overrides):
@@ -121,6 +146,12 @@ class Evaluator:
         
         with nvtx_range("Data_Loading_And_Parsing"):
             test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
+        
+        # for i in range(2):
+        #     print(f"\n" + "#"*20 + f" 样本 Index {i} 结构 " + "#"*20)
+        #     sample = test_dataset[i]  # 必须加索引 [i] 来触发数据加载
+        #     print_data_structure(sample)
+        #     print("#"*55 + "\n")
 
         eval_dir = self._output_dir
         os.makedirs(eval_dir, exist_ok=True)
