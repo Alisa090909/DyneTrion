@@ -77,10 +77,12 @@ class Evaluator:
         self._exp_conf = conf.experiment
 
         # Set-up GPU
-        if torch.cuda.is_available():
-            self.device = 'cuda:0'
-        else:
-            self.device = 'cpu'
+        # if torch.cuda.is_available():
+        #     self.device = 'cuda:0'
+        # else:
+        #     self.device = 'cpu'
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        self._conf.experiment.device = self.device
         self._log.info(f'Using device: {self.device}')
         # model weight
         self._weights_path = self._eval_conf.weights_path
@@ -119,7 +121,7 @@ class Evaluator:
         self.model.eval()
         
         with nvtx_range("compile-time"):
-            self.model = torch.compile(self.model) 
+            self.model = torch.compile(self.model, dynamic=True) 
         
         self.diffuser = self.exp.diffuser
 

@@ -179,15 +179,22 @@ class SO3Diffuser:
                     self._pdf, axis=-1)
         )) / np.sqrt(3)
         
-        self.device = torch.device('cuda') 
-        
-        # 预先将所有查找表搬到 GPU
-        self._score_norms_t = torch.tensor(self._score_norms, dtype=torch.float32, device=self.device)
-        self._pdf_t = torch.tensor(self._pdf, dtype=torch.float32, device=self.device)
-        self._cdf_t = torch.tensor(self._cdf, dtype=torch.float32, device=self.device)
-        self._discrete_omega_t = torch.tensor(self.discrete_omega, dtype=torch.float32, device=self.device)
-        self._discrete_sigma_t = torch.tensor(self.discrete_sigma, dtype=torch.float32, device=self.device)
-        self._score_scaling_t = torch.tensor(self._score_scaling, dtype=torch.float32, device=self.device)
+        self.gpu_initialized = False
+
+    def to_device(self, device):
+        if self.gpu_initialized: return
+        self.device = device
+        # 预载所有查找表
+        self._score_scaling_t = torch.tensor(self._score_scaling, device=device, dtype=torch.float32)
+        self._score_norms_t = torch.tensor(self._score_norms, device=device, dtype=torch.float32)
+        self._discrete_omega_t = torch.tensor(self.discrete_omega, device=device, dtype=torch.float32)
+        self._discrete_sigma_t = torch.tensor(self.discrete_sigma, device=device, dtype=torch.float32)
+        self._cdf_t = torch.tensor(self._cdf, device=device, dtype=torch.float32)
+        self._pdf_t = torch.tensor(self._pdf, device=device, dtype=torch.float32)
+        # 预计算常数
+        self._max_sigma_t = torch.tensor(self.max_sigma, device=device)
+        self._min_sigma_t = torch.tensor(self.min_sigma, device=device)
+        self.gpu_initialized = True
 
     @property
     def discrete_sigma(self):
@@ -220,7 +227,6 @@ class SO3Diffuser:
 
     def t_to_idx(self, t):
         if torch.is_tensor(t):
-            # 推荐直接使用预载 Tensor 的 shape
             max_idx = self._score_scaling_t.shape[0] - 1
             return torch.clamp(torch.round(t * max_idx), 0, max_idx).long()
         return self.sigma_idx(self.sigma(t))
@@ -229,39 +235,29 @@ class SO3Diffuser:
             if not torch.is_tensor(t):
                 t = torch.tensor(t, device=self.device)
                 
-            # 获取时间索引
             t_idx = self.t_to_idx(t) 
             
-            # 获取该时间点对应的 CDF 曲线 [num_omega]
-            # 注意：如果 t 是向量，cdf_t_row 形状为 [n_samples, num_omega]
             cdf_t_row = self._cdf_t[t_idx]
             
-            # 在 GPU 上生成随机数
             u = torch.rand(n_samples, device=self.device)
             
-            # 查表，使用 bucketize 找到索引：找到 u 在 CDF 里的位置 (等价于 np.interp)
             omega_idx = torch.bucketize(u, cdf_t_row)
             omega_idx = torch.clamp(omega_idx, 0, len(self._discrete_omega_t) - 1)
             
             return self._discrete_omega_t[omega_idx]    
     
     def sample(self, t, n_samples=1):
-            """GPU 版采样：生成轴角旋转向量 [n_samples, 3]"""
-            # 生成随机单位向量（旋转轴）
             x = torch.randn(n_samples, 3, device=self.device)
             x = x / (torch.linalg.norm(x, dim=-1, keepdim=True) + 1e-10)
             
-            # 采样旋转角
             angles = self.sample_igso3(t, n_samples=n_samples)
-            
-            # 轴 * 角
             return x * angles.unsqueeze(-1)    
 
     def sample_ref(self, n_samples: float=1):
         return self.sample(1, n_samples=n_samples)
 
     def score(self, vec: np.ndarray, t: float, eps: float=1e-6):
-            """保留 numpy 接口，但内部优化"""
+
             v_t = torch.as_tensor(vec, device=self.device, dtype=torch.float32)
             t_t = torch.as_tensor(t, device=self.device, dtype=torch.float32).view(1)
             
@@ -274,24 +270,19 @@ class SO3Diffuser:
         omega = torch.linalg.norm(vec, dim=-1) + eps
         device = vec.device
 
-        # 使用预载好的 GPU Tensor
         t_idx = self.t_to_idx(t)
 
         if self.use_cached_score:
-            # 获取当前时间步对应的分数曲线 [Batch, Omega_Bins]
             score_norms_t = self._score_norms_t[t_idx]
             
-            # 找到 omega 落在哪个 bin 里
             omega_idx = torch.bucketize(omega, self._discrete_omega_t[:-1])
             omega_idx = torch.clamp(omega_idx, 0, score_norms_t.shape[-1] - 1)
             
-            # 使用 gather 处理多维索引，确保 omega_idx 维度与 score_norms_t 匹配
             if score_norms_t.dim() > 1:
                 omega_scores_t = torch.gather(score_norms_t, -1, omega_idx)
             else:
                 omega_scores_t = score_norms_t[omega_idx]
         else:
-            # 非缓存模式逻辑
             sigma = self._discrete_sigma_t[t_idx]
             omega_vals = igso3_expansion(omega, sigma.unsqueeze(-1), use_torch=True)
             omega_scores_t = score(omega_vals, omega, sigma.unsqueeze(-1), use_torch=True)
@@ -299,13 +290,8 @@ class SO3Diffuser:
         return omega_scores_t[..., None] * vec / (omega[..., None] + eps)
 
     def score_scaling(self, t):
-        # 确保 _score_scaling 是 GPU Tensor (只在第一次转换)
-        if not torch.is_tensor(self._score_scaling):
-            device = t.device if torch.is_tensor(t) else torch.device('cuda')
-            self._score_scaling = torch.tensor(self._score_scaling, dtype=torch.float32, device=device)
-
         idx = self.t_to_idx(t) 
-        return self._score_scaling[idx]
+        return self._score_scaling_t[idx]
 
     def forward_marginal(self, rot_0: np.ndarray, t: float):
         """Samples from the forward diffusion process at time index t.
@@ -325,7 +311,7 @@ class SO3Diffuser:
         rot_t = du.compose_rotvec(rot_0.reshape(-1,3), sampled_rots).reshape(rot_0.shape)
         return rot_t, rot_score
 
-    def reverse(self,rot_t,score_t,t,dt,mask=None,noise_scale=1.0):
+    def reverse(self,rot_t,score_t,t,dt,sqrt_dt,mask=None,noise_scale=1.0):
         """Simulates the reverse SDE for 1 step using the Geodesic random walk.
 
         Args:
@@ -339,12 +325,8 @@ class SO3Diffuser:
         Returns:
             [..., 3] rotation vector at next step.
         """
-        device = rot_t.device
-        
         if not hasattr(self, '_max_sigma_t'):
-            self._max_sigma_t = torch.tensor(self.max_sigma, device=device)
-            self._min_sigma_t = torch.tensor(self.min_sigma, device=device)
-            self._sqrt_dt = torch.sqrt(torch.tensor(dt, device=device))
+            self.to_device(rot_t.device) 
         
         exp_max = torch.exp(self._max_sigma_t)
         exp_min = torch.exp(self._min_sigma_t)
@@ -353,10 +335,8 @@ class SO3Diffuser:
         g_t = torch.sqrt(2 * (exp_max - exp_min) * sigma_t / torch.exp(sigma_t))
         
         z = noise_scale * torch.randn_like(score_t)
-        perturb = (g_t ** 2) * score_t * dt + g_t * self._sqrt_dt * z
+        perturb = (g_t ** 2) * score_t * dt + g_t * sqrt_dt * z
 
         if mask is not None: perturb *= mask[..., None]
         
-        rot_t_1 = du.compose_rotvec(rot_t, perturb) 
-        
-        return rot_t_1
+        return du.compose_rotvec(rot_t, perturb) 

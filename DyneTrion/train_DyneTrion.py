@@ -89,6 +89,11 @@ class Experiment:
         self._use_recoder = self._exp_conf.use_recoder
         self._use_ddp = self._exp_conf.use_ddp
         self.dt_string = datetime.now().strftime("%dD_%mM_%YY_%Hh_%Mm_%Ss")
+        
+        # 接收注入的设备信息，并包装成 torch.device 对象
+        # 包装一下是为了后续调用 .type() 或某些算子时更稳定
+        self.device = torch.device(self._conf.experiment.device)
+        
         # 1. initialize ddp info if in ddp mode
         if self._use_ddp :
             dist.init_process_group(backend='nccl')
@@ -141,6 +146,16 @@ class Experiment:
         else:
             seed = dist.get_rank()
         self._set_seed(seed)
+        
+        self.num_t = self._data_conf.num_t 
+        self.reverse_steps = torch.linspace(self._data_conf.min_t, 1.0, self.num_t, device=self.device).flip(0)
+        self.t_placeholder = torch.ones((1,), device=self.device)
+        self.dt = 1.0 / self.num_t
+        self.sqrt_dt = torch.sqrt(torch.tensor(self.dt, device=self.device))
+        
+        self.diffuser._so3_diffuser.to_device(self.device)
+        self.diffuser._r3_diffuser.to_device(self.device)
+        
         
     def _init_best_eval(self):
         self.best_trained_steps = 0
@@ -766,20 +781,12 @@ class Experiment:
         """
         self._model.eval()
         # Run reverse process.
-        sample_feats = copy.deepcopy(data_init)
+        # sample_feats = copy.deepcopy(data_init)
+        sample_feats = {k: v for k, v in data_init.items()} 
         device = sample_feats['rigids_t'].device
 
-        t_placeholder = torch.ones((1,)).to(device)
-
-
-        if num_t is None:
-            num_t = self._data_conf.num_t
-        if min_t is None:
-            min_t = self._data_conf.min_t
-        # print("=" * 20, num_t)
-        # reverse_steps = np.linspace(min_t, 1.0, num_t)[::-1]
-        reverse_steps = torch.linspace(min_t, 1.0, num_t, device=device).flip(dims=(0,))
-        dt = 1/num_t
+        reverse_steps = self.reverse_steps 
+        t_placeholder = self.t_placeholder
         all_rigids = []
         all_bb_prots = []
         t_start = time.perf_counter()
@@ -793,21 +800,22 @@ class Experiment:
             for step_idx, t in enumerate(reverse_steps):
                 # model infer
                 nvtx.range_push("model_infer")
-                if t > min_t:
+                # if t > min_t:
+                if step_idx < len(reverse_steps) - 1: 
                     sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
                     model_out = self.model(sample_feats, is_training = self._exp_conf.training)
-                    rot_score = model_out['rot_score']
-                    trans_score = model_out['trans_score']
+                    # rot_score = model_out['rot_score']
+                    # trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
                     # use CFG inference
-                    nvtx.range_push("cfg_inference")
-                    if self._conf.model.cfg_drop_rate > 0.01:
-                        model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
-                        trans_score_unref = model_out_uncond["trans_score"]
-                        rot_score_unref = model_out_uncond["rot_score"]
-                        cfg_gamma = self._conf.model.cfg_gamma
-                        trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
-                    nvtx.range_pop()
+                    # nvtx.range_push("cfg_inference")
+                    # if self._conf.model.cfg_drop_rate > 0.01:
+                    #     model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
+                    #     trans_score_unref = model_out_uncond["trans_score"]
+                    #     rot_score_unref = model_out_uncond["rot_score"]
+                    #     cfg_gamma = self._conf.model.cfg_gamma
+                    #     trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
+                    # nvtx.range_pop()
 
                     nvtx.range_push("update_and_generate")
                     if self._model_conf.embed.embed_self_conditioning:
@@ -821,13 +829,15 @@ class Experiment:
                             trans_score=model_out['trans_score'],
                             diffuse_mask=sample_feats['res_mask'], # 确保是 Tensor
                             t=t, 
-                            dt=dt,
+                            dt=self.dt,
+                            sqrt_dt=self.sqrt_dt,
                             center=center,
                             noise_scale=noise_scale,
                             device=device
                         )
                     nvtx.range_pop()                   
                 else:
+                    # 这是最后一步 (t 等于 min_t)
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
                 sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)

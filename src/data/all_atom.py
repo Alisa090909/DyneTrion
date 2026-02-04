@@ -9,19 +9,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Rigid = ru.Rigid
 Rotation = ru.Rotation
 
-# Residue Constants from OpenFold/AlphaFold2.
-# IDEALIZED_POS37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions)#.to(device)
-# IDEALIZED_POS37_MASK = torch.any(IDEALIZED_POS37, axis=-1)#.to(device)
-# IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions)#.to(device)
-# DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame)#.to(device)
-# ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask)#.to(device)
-# GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group)#.to(device)
-
-# GROUP_IDX_37 = torch.tensor(residue_constants.restype_atom37_to_rigid_group)#.to(device)
-# ATOM_MASK_37 = torch.tensor(residue_constants.restype_atom37_mask)#.to(device)
-# IDEALIZED_POS_37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions)#.to(device)
-# restype_atom37_to_rigid_group
-
 IDEALIZED_POS37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device)
 IDEALIZED_POS37_MASK = torch.any(IDEALIZED_POS37, axis=-1).to(device)
 IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions).to(device)
