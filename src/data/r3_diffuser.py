@@ -16,6 +16,15 @@ class R3Diffuser:
         self._r3_conf = r3_conf
         self.min_b = r3_conf.min_b
         self.max_b = r3_conf.max_b
+        self.gpu_initialized = False
+
+    def to_device(self, device):
+        if self.gpu_initialized: return
+        self.device = device
+        self._min_b_t = torch.tensor(self.min_b, device=device, dtype=torch.float32)
+        self._b_diff_t = torch.tensor(self.max_b - self.min_b, device=device, dtype=torch.float32)
+        self._scaling_t = torch.tensor(self._r3_conf.coordinate_scaling, device=device, dtype=torch.float32)
+        self.gpu_initialized = True
 
     def _scale(self, x):
         return x * self._r3_conf.coordinate_scaling
@@ -24,9 +33,7 @@ class R3Diffuser:
         return x / self._r3_conf.coordinate_scaling
 
     def b_t(self, t):
-        if np.any(t < 0) or np.any(t > 1):
-            raise ValueError(f'Invalid t={t}')
-        return self.min_b + t*(self.max_b - self.min_b)
+        return self.min_b + t * self._b_diff_t
 
     def diffusion_coef(self, t):
         """Time-dependent diffusion coefficient."""
@@ -38,9 +45,9 @@ class R3Diffuser:
 
     def sample_ref(self, n_samples: float=1):
         return np.random.normal(size=(n_samples, 3))
-
+    
     def marginal_b_t(self, t):
-        return t*self.min_b + (1/2)*(t**2)*(self.max_b-self.min_b)
+        return t * self._min_b_t + 0.5 * (t**2) * self._b_diff_t
 
     def calc_trans_0(self, score_t, x_t, t, use_torch=True):
         beta_t = self.marginal_b_t(t)
@@ -99,21 +106,11 @@ class R3Diffuser:
         score_t = self.score(x_t, x_0, t)
         x_t = self._unscale(x_t)
         return x_t, score_t
+    
+    def score_scaling(self, t):
+        return 1 / torch.sqrt(self.conditional_var(t, use_torch=True))
 
-    def score_scaling(self, t: float):
-        return 1 / np.sqrt(self.conditional_var(t))
-
-    def reverse(
-            self,
-            *,
-            x_t: np.ndarray,
-            score_t: np.ndarray,
-            t: float,
-            dt: float,
-            mask: np.ndarray=None,
-            center: bool=True,
-            noise_scale: float=1.0,
-        ):
+    def reverse(self, *, x_t, score_t, t, dt, sqrt_dt, mask=None, center=True, noise_scale=1.0):
         """Simulates the reverse SDE for 1 step
 
         Args:
@@ -126,34 +123,39 @@ class R3Diffuser:
         Returns:
             [..., 3] positions at next step t-1.
         """
-        if not np.isscalar(t):
-            raise ValueError(f'{t} must be a scalar.')
-        x_t = self._scale(x_t)
-        g_t = self.diffusion_coef(t)
-        f_t = self.drift_coef(x_t, t)
-        z = noise_scale * np.random.normal(size=score_t.shape)
-        perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(dt) * z
+        
+        device = x_t.device
+        
+        x_t = x_t * self._scaling_t
+        
+        
+        beta_curr = self.b_t(t)
+        g_t = torch.sqrt(beta_curr)
+        f_t = -0.5 * beta_curr * x_t
+        
+        z = noise_scale * torch.randn_like(score_t)
+        
+        # 计算扰动
+        perturb = (f_t - beta_curr * score_t) * dt + g_t * sqrt_dt * z
 
         if mask is not None:
             perturb *= mask[..., None]
         else:
-            mask = np.ones(x_t.shape[:-1])
+            mask = torch.ones(x_t.shape[:-1], device=device)
+            
         x_t_1 = x_t - perturb   #(11,135,3)
+        
         if center:
-            com = np.sum(x_t_1, axis=-2) / np.sum(mask, axis=-1)[..., None]
-            x_t_1 -= com[..., None, :]
-        x_t_1 = self._unscale(x_t_1)
-        return x_t_1
+            mask_sum = torch.sum(mask, dim=-1, keepdim=True)
+            com = torch.sum(x_t_1, dim=-2) / (mask_sum + 1e-10)
+            x_t_1 -= com.unsqueeze(-2) # 自动对齐维度
+    
+        # 反缩放并返回
+        return x_t_1 / self._scaling_t
 
-    def conditional_var(self, t, use_torch=False):
-        """Conditional variance of p(xt|x0).
-
-        Var[x_t|x_0] = conditional_var(t)*I
-
-        """
-        if use_torch:
-            return 1 - torch.exp(-self.marginal_b_t(t))
-        return 1 - np.exp(-self.marginal_b_t(t))
+    def conditional_var(self, t, use_torch=True):
+        """xt|x0 的条件方差"""
+        return 1.0 - torch.exp(-self.marginal_b_t(t))
 
     def score(self, x_t, x_0, t, use_torch=False, scale=False):
         if use_torch:

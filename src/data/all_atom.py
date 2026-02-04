@@ -9,18 +9,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Rigid = ru.Rigid
 Rotation = ru.Rotation
 
-# Residue Constants from OpenFold/AlphaFold2.
-IDEALIZED_POS37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions)#.to(device)
-IDEALIZED_POS37_MASK = torch.any(IDEALIZED_POS37, axis=-1)#.to(device)
-IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions)#.to(device)
-DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame)#.to(device)
-ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask)#.to(device)
-GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group)#.to(device)
+IDEALIZED_POS37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device)
+IDEALIZED_POS37_MASK = torch.any(IDEALIZED_POS37, axis=-1).to(device)
+IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions).to(device)
+DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame).to(device)
+ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask).to(device)
+GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group).to(device)
 
-GROUP_IDX_37 = torch.tensor(residue_constants.restype_atom37_to_rigid_group)#.to(device)
-ATOM_MASK_37 = torch.tensor(residue_constants.restype_atom37_mask)#.to(device)
-IDEALIZED_POS_37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions)#.to(device)
-# restype_atom37_to_rigid_group
+GROUP_IDX_37 = torch.tensor(residue_constants.restype_atom37_to_rigid_group).to(device)
+ATOM_MASK_37 = torch.tensor(residue_constants.restype_atom37_mask).to(device)
+IDEALIZED_POS_37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device)
+
 
 def torsion_angles_to_frames(
         r: Rigid,
@@ -196,6 +195,27 @@ def compute_backbone_atom37(bb_rigids,aatypes, torsions):
 
     return atom37_bb_pos, atom37_mask, aatype,0
 
+# @torch.compile  # 不能调整，torch.compile和OpenFold不兼容
+# def compute_backbone_atom37(bb_rigids, aatypes, torsions):
+    
+#     device = bb_rigids.device # 获取当前 GPU 设备
+#     torsion_angles = torsions.to(device)
+#     aatype = aatypes.long().to(device) # 确保 aatype 也在 GPU 上
+
+#     # 这里的 feats.torsion_angles_to_frames 是 OpenFold 的复杂逻辑
+#     # 嵌套在 @torch.compile 下，它内部的所有碎步骤都会被一起优化
+#     all_frames = feats.torsion_angles_to_frames(
+#         bb_rigids,
+#         torsion_angles,
+#         aatype,
+#         DEFAULT_FRAMES.to(device) # 使用预备好的 GPU 常量
+#     )
+    
+#     # 这一步同样是几何变换，也被 compile 包裹了
+#     atom37_bb_pos = frames_to_atom37_pos(all_frames, aatype)
+#     atom37_mask = torch.any(atom37_bb_pos, axis=-1)
+
+#     return atom37_bb_pos, atom37_mask, aatype, 0
 
 def frames_to_atom37_pos(
         r: Rigid,
@@ -203,6 +223,7 @@ def frames_to_atom37_pos(
     ):
     # [*, N, 37]
     aatype = aatype.cpu()
+    # aatype = aatype.to(r.device)
     group_mask = GROUP_IDX_37[aatype, ...]
 
     # [*, N, 37, 8]

@@ -8,25 +8,26 @@ from src.data import utils as du
 import torch
 import logging
 
-def _extract_trans_rots(rigid: ru.Rigid):
-    rot = rigid.get_rots().get_rot_mats().cpu().numpy()
-    rot_shape = rot.shape
-    num_rots = np.cumprod(rot_shape[:-2])[-1]
-    rot = rot.reshape((num_rots, 3, 3))
-    rot = Rotation.from_matrix(rot).as_rotvec().reshape(rot_shape[:-2] +(3,))
-    tran = rigid.get_trans().cpu().numpy()
-    return tran, rot
 
-def _assemble_rigid(rotvec, trans,device=torch.device('cpu')):
-    rotvec_shape = rotvec.shape
-    num_rotvecs = np.cumprod(rotvec_shape[:-1])[-1]
-    rotvec = rotvec.reshape((num_rotvecs, 3))
-    rotmat = Rotation.from_rotvec(rotvec).as_matrix().reshape(
-        rotvec_shape[:-1] + (3, 3))
+def _extract_trans_rots(rigid: ru.Rigid):
+    tran = rigid.get_trans()
+    quat = rigid.get_rots().get_quats()
+    rotvec = du.quat_to_rotvec(quat) 
+    return tran, rotvec
+
+def _assemble_rigid(rotvec, trans, device=torch.device('cpu')):
+    if not torch.is_tensor(rotvec):
+        rotvec = torch.tensor(rotvec, device=device).float()
+    if not torch.is_tensor(trans):
+        trans = torch.tensor(trans, device=device).float()
+    
+    rotvec = rotvec.to(device)
+    trans = trans.to(device)
+    
+    rotmat = du.torch_rotvec_to_matrix(rotvec)
     return ru.Rigid(
-            rots=ru.Rotation(
-                rot_mats=torch.Tensor(rotmat).to(device)),
-            trans=torch.tensor(trans).to(device))
+            rots=ru.Rotation(rot_mats=rotmat.to(device)),
+            trans=trans.to(device))
 
 class SE3Diffuser:
 
@@ -157,62 +158,37 @@ class SE3Diffuser:
         trans_score_scaling = self._r3_diffuser.score_scaling(t)
         return rot_score_scaling, trans_score_scaling
 
-    def reverse(
-            self,
-            rigid_t: ru.Rigid,
-            rot_score: np.ndarray,
-            trans_score: np.ndarray,
-            t: float,
-            dt: float,
-            diffuse_mask: np.ndarray = None,
-            center: bool=True,
-            noise_scale: float=1.0,
-            device: torch.device = torch.device('cpu')
-        ):
-        """Reverse sampling function from (t) to (t-1).
-
-        Args:
-            rigid_t: [..., N] protein rigid objects at time t.
-            rot_score: [..., N, 3] rotation score.
-            trans_score: [..., N, 3] translation score.
-            t: continuous time in [0, 1].
-            dt: continuous step size in [0, 1].
-            mask: [..., N] which residues to update.
-            center: true to set center of mass to zero after step
-
-        Returns:
-            rigid_t_1: [..., N] protein rigid objects at time t-1.
-        """
+    def reverse(self, rigid_t, rot_score, trans_score, t, dt,sqrt_dt,diffuse_mask=None, center=True, noise_scale=1.0, device=None):
+        
+        if device is None:
+            device = rigid_t.device 
+        
         trans_t, rot_t = _extract_trans_rots(rigid_t)
-        if not self._diffuse_rot:
-            rot_t_1 = rot_t
-        else:
-            rot_t_1 = self._so3_diffuser.reverse(
-                rot_t=rot_t,
-                score_t=rot_score,
-                t=t,
-                dt=dt,
-                noise_scale=noise_scale,
-                )
-        if not self._diffuse_trans:
-            trans_t_1 = trans_t
-        else:
-            trans_t_1 = self._r3_diffuser.reverse(
-                x_t=trans_t,
-                score_t=trans_score,
-                t=t,
-                dt=dt,
-                center=center,
-                noise_scale=noise_scale
-                )
+        
+        rot_t_1 = self._so3_diffuser.reverse(
+            rot_t=rot_t,
+            score_t=rot_score,
+            t=t,
+            dt=dt,
+            sqrt_dt=sqrt_dt,
+            noise_scale=noise_scale,
+        )
+        
+        trans_t_1 = self._r3_diffuser.reverse(
+            x_t=trans_t,
+            score_t=trans_score,
+            t=t,
+            dt=dt,
+            sqrt_dt=sqrt_dt,
+            center=center,
+            noise_scale=noise_scale
+        )
 
         if diffuse_mask is not None:
-            trans_t_1 = self._apply_mask(
-                trans_t_1, trans_t, diffuse_mask[..., None])
-            rot_t_1 = self._apply_mask(
-                rot_t_1, rot_t, diffuse_mask[..., None])
+            trans_t_1 = diffuse_mask[..., None] * trans_t_1 + (1 - diffuse_mask[..., None]) * trans_t
+            rot_t_1 = diffuse_mask[..., None] * rot_t_1 + (1 - diffuse_mask[..., None]) * rot_t
 
-        return _assemble_rigid(rot_t_1, trans_t_1,device)
+        return _assemble_rigid(rot_t_1, trans_t_1, device)
 
     def sample_ref(
             self,

@@ -16,14 +16,47 @@ from omegaconf import DictConfig
 from omegaconf import OmegaConf
 from torch.utils import data
 from typing import Dict
+from contextlib import contextmanager
+import torch.cuda.nvtx as nvtx
 
 from src.data import DyneTrion_data_loader_dynamic
 from src.data import utils as du
 import DyneTrion.train_DyneTrion as train_DyneTrion
 
+# def print_data_structure(data, name="root", indent=0):
+#     shift = "    " * indent
+    
+#     # 情况 A: 字典 (最常见，包含各个 Feature)
+#     if isinstance(data, dict):
+#         print(f"{shift}{name} (dict):")
+#         for k, v in data.items():
+#             print_data_structure(v, k, indent + 1)
+            
+#     # 情况 B: 元组或列表 (你的数据外层包装)
+#     elif isinstance(data, (list, tuple)):
+#         print(f"{shift}{name} ({type(data).__name__}) length={len(data)}:")
+#         for i, v in enumerate(data):
+#             print_data_structure(v, f"Index {i}", indent + 1)
+            
+#     # 情况 C: PyTorch Tensor (这是你最关心的维度)
+#     elif torch.is_tensor(data):
+#         print(f"{shift}{name}: Tensor shape={list(data.shape)}, dtype={data.dtype}, device={data.device}")
+        
+#     # 情况 D: 普通 Python 类型 (String, int, float)
+#     else:
+#         # 如果字符串太长则截断
+#         val_str = str(data)
+#         if len(val_str) > 50:
+#             val_str = val_str[:47] + "..."
+#         print(f"{shift}{name}: {type(data).__name__} = {val_str}")
 
-
-
+@contextmanager
+def nvtx_range(name):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 class Evaluator:
     def __init__(
@@ -44,10 +77,12 @@ class Evaluator:
         self._exp_conf = conf.experiment
 
         # Set-up GPU
-        if torch.cuda.is_available():
-            self.device = 'cuda:0'
-        else:
-            self.device = 'cpu'
+        # if torch.cuda.is_available():
+        #     self.device = 'cuda:0'
+        # else:
+        #     self.device = 'cpu'
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        self._conf.experiment.device = self.device
         self._log.info(f'Using device: {self.device}')
         # model weight
         self._weights_path = self._eval_conf.weights_path
@@ -57,8 +92,6 @@ class Evaluator:
         self._log.info(f'Saving results to {self._output_dir}')
         # Load models and experiment
         self._load_ckpt(conf_overrides)
-
-
         
 
     def _load_ckpt(self, conf_overrides):
@@ -86,6 +119,10 @@ class Evaluator:
 
         self.model = self.model.to(self.device)
         self.model.eval()
+        
+        with nvtx_range("compile-time"):
+            self.model = torch.compile(self.model, dynamic=True) 
+        
         self.diffuser = self.exp.diffuser
 
         self._log.info(f"Loading model Successfully from {self._weights_path}!!!")
@@ -106,9 +143,17 @@ class Evaluator:
         # define data process
         # we need to call the MD simulation to get the data
         # maybe add some func in the dateset class
+        print("开始精准性能采集...")
+        torch.cuda.profiler.start()
         
+        with nvtx_range("Data_Loading_And_Parsing"):
+            test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
         
-        test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
+        # for i in range(2):
+        #     print(f"\n" + "#"*20 + f" 样本 Index {i} 结构 " + "#"*20)
+        #     sample = test_dataset[i]  # 必须加索引 [i] 来触发数据加载
+        #     print_data_structure(sample)
+        #     print("#"*55 + "\n")
 
         eval_dir = self._output_dir
         os.makedirs(eval_dir, exist_ok=True)
@@ -127,20 +172,24 @@ class Evaluator:
             valid_feats, pdb_names = test_dataset._get_row(i)
             for k,v in valid_feats.items():
                 valid_feats[k] = v.unsqueeze(0)
-            self.exp._process_one_protein_extrapolation(
-                extrapolation_time,
-                valid_feats,
-                [pdb_names],
-                ref_base_path,
-                pdb_base_path,
-                device=self.device,
-                noise_scale=self.exp._exp_conf.noise_scale,
-            )
-
-
+            with nvtx_range(f"process_one_protein_extrapolation"):
+                self.exp._process_one_protein_extrapolation(
+                    extrapolation_time,
+                    valid_feats,
+                    [pdb_names],
+                    ref_base_path,
+                    pdb_base_path,
+                    device=self.device,
+                    noise_scale=self.exp._exp_conf.noise_scale,
+                )
+        torch.cuda.profiler.stop()   # <--- 录制结束
+        print("性能采集结束。")
 
 @hydra.main(version_base=None, config_path="./config", config_name="eval_DyneTrion")
 def run(conf: DictConfig) -> None:
+    
+    torch.set_float32_matmul_precision('high')
+    
     # Read model checkpoint.
     print('Starting inference')
     start_time = time.time()

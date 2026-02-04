@@ -26,6 +26,8 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils import data
 import mdtraj as md
+from contextlib import contextmanager
+import torch.cuda.nvtx as nvtx
 
 import swanlab
 from tqdm import tqdm
@@ -40,7 +42,11 @@ from openfold.utils import rigid_utils as ru
 from openfold.utils.loss import lddt_ca, torsion_angle_loss
 from src.data import DyneTrion_data_loader_dynamic
 from src.analysis import utils as au
-from src.data import se3_diffuser, all_atom
+# from src.data import se3_diffuser, all_atom
+
+from src.data import se3_diffuser
+from src.data import all_atom_zxm as all_atom
+
 from src.data import utils as du
 from src.experiments import utils as eu
 from src.model import diffusion_4d_network_dynamic
@@ -48,6 +54,14 @@ from src.toolbox.rot_trans_error import (
     average_quaternion_distances,
     average_translation_distances,
 )
+
+@contextmanager
+def nvtx_range(name):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 class Experiment:
 
@@ -75,6 +89,11 @@ class Experiment:
         self._use_recoder = self._exp_conf.use_recoder
         self._use_ddp = self._exp_conf.use_ddp
         self.dt_string = datetime.now().strftime("%dD_%mM_%YY_%Hh_%Mm_%Ss")
+        
+        # 接收注入的设备信息，并包装成 torch.device 对象
+        # 包装一下是为了后续调用 .type() 或某些算子时更稳定
+        self.device = torch.device(self._conf.experiment.device)
+        
         # 1. initialize ddp info if in ddp mode
         if self._use_ddp :
             dist.init_process_group(backend='nccl')
@@ -127,6 +146,16 @@ class Experiment:
         else:
             seed = dist.get_rank()
         self._set_seed(seed)
+        
+        self.num_t = self._data_conf.num_t 
+        self.reverse_steps = torch.linspace(self._data_conf.min_t, 1.0, self.num_t, device=self.device).flip(0)
+        self.t_placeholder = torch.ones((1,), device=self.device)
+        self.dt = 1.0 / self.num_t
+        self.sqrt_dt = torch.sqrt(torch.tensor(self.dt, device=self.device))
+        
+        self.diffuser._so3_diffuser.to_device(self.device)
+        self.diffuser._r3_diffuser.to_device(self.device)
+        
         
     def _init_best_eval(self):
         self.best_trained_steps = 0
@@ -317,7 +346,7 @@ class Experiment:
         #                 state[k] = v.to(device)
 
         self._model.train()
-                    
+        
         (train_loader,valid_loader) = self.create_dataset()
 
         logs = []
@@ -385,7 +414,7 @@ class Experiment:
             if return_logs:
                 global_logs.append(loss)
             for k,v in aux_data.items():
-                log_lossses[k].append(du.move_to_np(v))
+                log_lossses[k].append(v)
             self.trained_steps += 1
 
             if self.trained_steps == 1 or self.trained_steps % self._exp_conf.log_freq == 0:
@@ -752,66 +781,71 @@ class Experiment:
         """
         self._model.eval()
         # Run reverse process.
-        sample_feats = copy.deepcopy(data_init)
+        # sample_feats = copy.deepcopy(data_init)
+        sample_feats = {k: v for k, v in data_init.items()} 
         device = sample_feats['rigids_t'].device
 
-        t_placeholder = torch.ones((1,)).to(device)
-
-
-        if num_t is None:
-            num_t = self._data_conf.num_t
-        if min_t is None:
-            min_t = self._data_conf.min_t
-        # print("=" * 20, num_t)
-        reverse_steps = np.linspace(min_t, 1.0, num_t)[::-1]
-        dt = 1/num_t
+        reverse_steps = self.reverse_steps 
+        t_placeholder = self.t_placeholder
         all_rigids = []
         all_bb_prots = []
         t_start = time.perf_counter()
         with torch.no_grad():
             # self-condition
+            nvtx.range_push("self_condition")
             if self._model_conf.embed.embed_self_conditioning and self_condition:
                 sample_feats = self._set_t_feats(sample_feats, reverse_steps[0], t_placeholder)
                 sample_feats = self._self_conditioning(sample_feats)
+            nvtx.range_pop()
             for step_idx, t in enumerate(reverse_steps):
                 # model infer
-                if t > min_t:
+                nvtx.range_push("model_infer")
+                # if t > min_t:
+                if step_idx < len(reverse_steps) - 1: 
                     sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
                     model_out = self.model(sample_feats, is_training = self._exp_conf.training)
-                    rot_score = model_out['rot_score']
-                    trans_score = model_out['trans_score']
+                    # rot_score = model_out['rot_score']
+                    # trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
                     # use CFG inference
-                    if self._conf.model.cfg_drop_rate > 0.01:
-                        model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
-                        trans_score_unref = model_out_uncond["trans_score"]
-                        rot_score_unref = model_out_uncond["rot_score"]
-                        cfg_gamma = self._conf.model.cfg_gamma
-                        trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
+                    # nvtx.range_push("cfg_inference")
+                    # if self._conf.model.cfg_drop_rate > 0.01:
+                    #     model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
+                    #     trans_score_unref = model_out_uncond["trans_score"]
+                    #     rot_score_unref = model_out_uncond["rot_score"]
+                    #     cfg_gamma = self._conf.model.cfg_gamma
+                    #     trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
+                    # nvtx.range_pop()
 
+                    nvtx.range_push("update_and_generate")
                     if self._model_conf.embed.embed_self_conditioning:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
                     diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
-                    rigids_t = self.diffuser.reverse(
-                        rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
-                        rot_score=du.move_to_np(rot_score),
-                        trans_score=du.move_to_np(trans_score),
-                        diffuse_mask=du.move_to_np(diffuse_mask),
-                        t=t,
-                        dt=dt,
-                        center=center,
-                        noise_scale=noise_scale,
-                        device=device
-                    )
+                    with autocast(dtype=torch.bfloat16):
+                        rigids_t = self.diffuser.reverse(
+                            rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
+                            rot_score=model_out['rot_score'], 
+                            trans_score=model_out['trans_score'],
+                            diffuse_mask=sample_feats['res_mask'], # 确保是 Tensor
+                            t=t, 
+                            dt=self.dt,
+                            sqrt_dt=self.sqrt_dt,
+                            center=center,
+                            noise_scale=noise_scale,
+                            device=device
+                        )
+                    nvtx.range_pop()                   
                 else:
+                    # 这是最后一步 (t 等于 min_t)
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
                 sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
                 infer_end_time = time.time()
+                nvtx.range_pop() 
                 # post process
                 if aux_traj:
-                    all_rigids.append(du.move_to_np(model_out['rigids']))
+                    all_rigids.append(model_out['rigids'])
 
                 gt_trans_0 = sample_feats['rigids_t'][..., 4:]
                 pred_trans_0 = rigid_pred[..., 4:]
@@ -824,11 +858,12 @@ class Experiment:
                         aatypes=sample_feats['aatype'],
                         torsions = angles
                         )[0]
-                    all_bb_prots.append(du.move_to_np(atom37_t))
+                    all_bb_prots.append(atom37_t)
         # 
         inference_time = time.perf_counter() - t_start
         print(f"inference_time:{inference_time:.2f} | num_t:{num_t} | noise_scale:{noise_scale}")
-        flip = lambda x: np.flip(np.stack(x), (0,))
+        # flip = lambda x: np.flip(np.stack(x), (0,))
+        flip = lambda x: torch.flip(torch.stack(x), dims=(0,))
         all_bb_prots = flip(all_bb_prots)
         all_rigids = flip(all_rigids)
         ret = {
@@ -1028,7 +1063,8 @@ class Experiment:
             align_metric_list.append((rot, trans))
             aligned = np.dot(pred_traj[frame_idx], rot) + trans
             aligned *= atom37_mask[frame_idx][..., None]  # apply mask
-            align_sample_list.append(torch.from_numpy(aligned))
+            # align_sample_list.append(torch.from_numpy(aligned))
+            align_sample_list.append(aligned)
 
         aligned_sample = torch.stack(align_sample_list)
         return aligned_sample, align_metric_list
@@ -1112,47 +1148,7 @@ class Experiment:
 
         # === save GT
         aatype = valid_feats["aatype"][0, 0].cpu().numpy()
-        au.write_prot_to_pdb(
-            prot_pos=valid_feats["atom37_pos"][0].cpu().numpy(),
-            file_path=gt_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
-
-        # === save aligned prediction
-        au.write_prot_to_pdb(
-            prot_pos=align_sample.cpu().numpy(),
-            file_path=sample_aligned_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
-
-        # === save unaligned prediction
-        au.write_prot_to_pdb(
-            prot_pos=sample_out["prot_traj"][0],
-            file_path=sample_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
-
-        # === save first_motion
-        au.write_prot_to_pdb(
-            prot_pos=np.concatenate(
-                (
-                    valid_feats["motion_atom37_pos"][0].cpu().numpy(),
-                    valid_feats["ref_atom37_pos"][0].cpu().numpy(),
-                ),
-                axis=0,
-            ),
-            file_path=first_motion_path,
-            aatype=aatype,
-            no_indexing=True,
-            b_factors=b_factors,
-        )
-
+        
         # === save npz if not training
         if not is_training and dirs.get("pred_npz"):
 
@@ -1187,6 +1183,8 @@ class Experiment:
         noise_scale=1.0,
     ):
         """Process one protein sequence and perform trajectory extrapolation."""
+        
+        # print(f"================pdb_names:{pdb_names}")
 
         # === Preparation ===
         protein_name = pdb_names[0]
@@ -1201,6 +1199,10 @@ class Experiment:
         if os.path.exists(pdb_path):
             print(f"✅ {protein_name} already existed in: {pdb_path}")
             return 
+        
+        # print(f"DEBUG: rigids_t shape = {valid_feats['rigids_t'].shape}")
+        # print(f"DEBUG: node_repr shape = {valid_feats['node_repr'].shape}")
+        
         # Save reference structure
         ref_all_atom_positions = valid_feats["ref_atom37_pos"][0].cpu().numpy()
         au.write_prot_to_pdb(
@@ -1248,16 +1250,24 @@ class Experiment:
             )
 
         # === Concatenate trajectory and save ===
-        atom_traj = np.concatenate(atom_traj, axis=0)
-        rigid_traj = np.concatenate(rigid_traj, axis=0)
+        # atom_traj = np.concatenate(atom_traj, axis=0)
+        # rigid_traj = np.concatenate(rigid_traj, axis=0)
         
-        au.write_prot_to_pdb(
-            prot_pos=atom_traj,
-            file_path=pdb_path,
-            aatype=aatype[0, 0],
-            no_indexing=True,
-            b_factors=b_factors,
-        )
+        atom_traj = torch.cat(atom_traj, dim=0)
+        rigid_traj = torch.cat(rigid_traj, dim=0)
+        if torch.is_tensor(atom_traj):
+            atom_traj = atom_traj.detach().cpu().numpy()
+        if torch.is_tensor(rigid_traj):
+            rigid_traj = rigid_traj.detach().cpu().numpy()
+        
+        with nvtx_range("PDB_Writing_IO"):
+            au.write_prot_to_pdb(
+                prot_pos=atom_traj,
+                file_path=pdb_path,
+                aatype=aatype[0, 0],
+                no_indexing=True,
+                b_factors=b_factors,
+            )
     def _prepare_init_feats(self, valid_feats, device, frame_time, sample_length):
         """Prepare initial features for inference."""
         res_mask = np.ones((frame_time, sample_length))
@@ -1299,13 +1309,15 @@ class Experiment:
         concat_rigids = torch.cat([
             valid_feats["motion_rigids_0"].to(device),
             valid_feats["ref_rigids_0"].to(device),
-            torch.from_numpy(rigid_pred).to(device).to(valid_feats["motion_rigids_0"].dtype),
+            # torch.from_numpy(rigid_pred).to(device).to(valid_feats["motion_rigids_0"].dtype), #(rigid_pred if torch.is_tensor(rigid_pred) else torch.from_numpy(rigid_pred))
+            rigid_pred.to(device).to(valid_feats["motion_rigids_0"].dtype),
         ], dim=0)
 
         concat_atoms = torch.cat([
             valid_feats["motion_atom37_pos"].to(device),
             valid_feats["ref_atom37_pos"].to(device),
-            torch.from_numpy(atom_pred).to(device).to(valid_feats["motion_atom37_pos"].dtype),
+            # torch.from_numpy(atom_pred).to(device).to(valid_feats["motion_atom37_pos"].dtype),
+            atom_pred.to(device).to(valid_feats["motion_atom37_pos"].dtype),
         ], dim=0)
         if change_ref:
             # valid_feats["ref_rigids_0"] = concat_rigids[-ref_number:]#.unsqueeze(0)
@@ -1364,8 +1376,6 @@ class Experiment:
         valid_feats["rigids_t"] = ref_sample["rigids_t"].to(device)
 
         return valid_feats
-    
-    
     
     def _update_best_model(self, mean_dict: dict, rot_trans_error_mean: dict) -> bool:
         """

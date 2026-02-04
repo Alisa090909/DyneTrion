@@ -18,7 +18,6 @@ from typing import Tuple, Any, Sequence, Callable, Optional
 import numpy as np
 import torch
 
-
 def rot_matmul(
     a: torch.Tensor, 
     b: torch.Tensor
@@ -181,6 +180,8 @@ _QTR_MAT[..., 2, 0] = _to_mat([("bd", 2), ("ac", -2)])
 _QTR_MAT[..., 2, 1] = _to_mat([("cd", 2), ("ab", 2)])
 _QTR_MAT[..., 2, 2] = _to_mat([("aa", 1), ("bb", -1), ("cc", -1), ("dd", 1)])
 
+_QTR_MAT = torch.tensor(_QTR_MAT, dtype=torch.float32)
+
 
 def quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
     """
@@ -195,7 +196,8 @@ def quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
     quat = quat[..., None] * quat[..., None, :]
 
     # [4, 4, 3, 3]
-    mat = quat.new_tensor(_QTR_MAT, requires_grad=False)
+    # mat = quat.new_tensor(_QTR_MAT, requires_grad=False)
+    mat = _QTR_MAT.to(device=quat.device, dtype=quat.dtype)
 
     # [*, 4, 4, 3, 3]
     shaped_qtr_mat = mat.view((1,) * len(quat.shape[:-2]) + mat.shape)
@@ -223,8 +225,10 @@ def rot_to_quat(
 
     k = (1./3.) * torch.stack([torch.stack(t, dim=-1) for t in k], dim=-2)
 
-    _, vectors = torch.linalg.eigh(k.cpu())
-    return vectors[..., -1].to(k.device)
+    # _, vectors = torch.linalg.eigh(k.cpu())
+    # return vectors[..., -1].to(k.device)
+    _, vectors = torch.linalg.eigh(k)
+    return vectors[..., -1]
 
 
 _QUAT_MULTIPLY = np.zeros((4, 4, 4))
@@ -250,10 +254,14 @@ _QUAT_MULTIPLY[:, :, 3] = [[ 0, 0, 0, 1],
 
 _QUAT_MULTIPLY_BY_VEC = _QUAT_MULTIPLY[:, 1:, :]
 
+_QUAT_MULTIPLY = torch.tensor(_QUAT_MULTIPLY, dtype=torch.float32)
+_QUAT_MULTIPLY_BY_VEC = torch.tensor(_QUAT_MULTIPLY_BY_VEC, dtype=torch.float32)
+
 
 def quat_multiply(quat1, quat2):
     """Multiply a quaternion by another quaternion."""
-    mat = quat1.new_tensor(_QUAT_MULTIPLY)
+    # mat = quat1.new_tensor(_QUAT_MULTIPLY)
+    mat = _QUAT_MULTIPLY.to(device=quat1.device, dtype=quat1.dtype)
     reshaped_mat = mat.view((1,) * len(quat1.shape[:-1]) + mat.shape)
     return torch.sum(
         reshaped_mat *
@@ -265,7 +273,8 @@ def quat_multiply(quat1, quat2):
 
 def quat_multiply_by_vec(quat, vec):
     """Multiply a quaternion by a pure-vector quaternion."""
-    mat = quat.new_tensor(_QUAT_MULTIPLY_BY_VEC)
+    # mat = quat.new_tensor(_QUAT_MULTIPLY_BY_VEC)
+    mat = _QUAT_MULTIPLY_BY_VEC.to(device=quat.device, dtype=quat.dtype)
     reshaped_mat = mat.view((1,) * len(quat.shape[:-1]) + mat.shape)
     return torch.sum(
         reshaped_mat *
