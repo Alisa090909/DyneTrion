@@ -45,7 +45,11 @@ from src.analysis import utils as au
 # from src.data import se3_diffuser, all_atom
 
 from src.data import se3_diffuser
-from src.data import all_atom_zxm as all_atom
+# from src.data import all_atom
+# from src.data import all_atom_zxm as all_atom
+
+# from src.data import se3_diffuser0209 as se3_diffuser
+from src.data import all_atom0209 as all_atom
 
 from src.data import utils as du
 from src.experiments import utils as eu
@@ -792,20 +796,17 @@ class Experiment:
         t_start = time.perf_counter()
         with torch.no_grad():
             # self-condition
-            nvtx.range_push("self_condition")
+            # nvtx.range_push("self_condition")
             if self._model_conf.embed.embed_self_conditioning and self_condition:
                 sample_feats = self._set_t_feats(sample_feats, reverse_steps[0], t_placeholder)
                 sample_feats = self._self_conditioning(sample_feats)
-            nvtx.range_pop()
+            # nvtx.range_pop()
             for step_idx, t in enumerate(reverse_steps):
                 # model infer
-                nvtx.range_push("model_infer")
-                # if t > min_t:
+                # nvtx.range_push("model_infer")
                 if step_idx < len(reverse_steps) - 1: 
                     sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
                     model_out = self.model(sample_feats, is_training = self._exp_conf.training)
-                    # rot_score = model_out['rot_score']
-                    # trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
                     # use CFG inference
                     # nvtx.range_push("cfg_inference")
@@ -817,7 +818,7 @@ class Experiment:
                     #     trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
                     # nvtx.range_pop()
 
-                    nvtx.range_push("update_and_generate")
+                    # nvtx.range_push("update_and_generate")
                     if self._model_conf.embed.embed_self_conditioning:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
@@ -827,7 +828,7 @@ class Experiment:
                             rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
                             rot_score=model_out['rot_score'], 
                             trans_score=model_out['trans_score'],
-                            diffuse_mask=sample_feats['res_mask'], # 确保是 Tensor
+                            diffuse_mask=sample_feats['res_mask'], 
                             t=t, 
                             dt=self.dt,
                             sqrt_dt=self.sqrt_dt,
@@ -835,24 +836,23 @@ class Experiment:
                             noise_scale=noise_scale,
                             device=device
                         )
-                    nvtx.range_pop()                   
+                    # nvtx.range_pop()                   
                 else:
-                    # 这是最后一步 (t 等于 min_t)
+                    # 最后一步
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
                 sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
-                infer_end_time = time.time()
-                nvtx.range_pop() 
+                # nvtx.range_pop() 
                 # post process
                 if aux_traj:
                     all_rigids.append(model_out['rigids'])
 
-                gt_trans_0 = sample_feats['rigids_t'][..., 4:]
-                pred_trans_0 = rigid_pred[..., 4:]
-                trans_pred_0 = diffuse_mask[..., None] * pred_trans_0 + fixed_mask[..., None] * gt_trans_0
-                
-                angles = model_out['angles']
                 if step_idx == len(reverse_steps)-1:
+                    gt_trans_0 = sample_feats['rigids_t'][..., 4:]
+                    pred_trans_0 = rigid_pred[..., 4:]
+                    trans_pred_0 = diffuse_mask[..., None] * pred_trans_0 + fixed_mask[..., None] * gt_trans_0
+                    
+                    angles = model_out['angles']
                     atom37_t = all_atom.compute_backbone_atom37(
                         bb_rigids=rigids_t, 
                         aatypes=sample_feats['aatype'],
@@ -862,7 +862,6 @@ class Experiment:
         # 
         inference_time = time.perf_counter() - t_start
         print(f"inference_time:{inference_time:.2f} | num_t:{num_t} | noise_scale:{noise_scale}")
-        # flip = lambda x: np.flip(np.stack(x), (0,))
         flip = lambda x: torch.flip(torch.stack(x), dims=(0,))
         all_bb_prots = flip(all_bb_prots)
         all_rigids = flip(all_rigids)
@@ -1181,11 +1180,9 @@ class Experiment:
         min_t=None,
         num_t=None,
         noise_scale=1.0,
+        executor=None,
     ):
         """Process one protein sequence and perform trajectory extrapolation."""
-        
-        # print(f"================pdb_names:{pdb_names}")
-
         # === Preparation ===
         protein_name = pdb_names[0]
         frame_time = self._model_conf.frame_time
@@ -1199,9 +1196,6 @@ class Experiment:
         if os.path.exists(pdb_path):
             print(f"✅ {protein_name} already existed in: {pdb_path}")
             return 
-        
-        # print(f"DEBUG: rigids_t shape = {valid_feats['rigids_t'].shape}")
-        # print(f"DEBUG: node_repr shape = {valid_feats['node_repr'].shape}")
         
         # Save reference structure
         ref_all_atom_positions = valid_feats["ref_atom37_pos"][0].cpu().numpy()
@@ -1250,23 +1244,28 @@ class Experiment:
             )
 
         # === Concatenate trajectory and save ===
-        # atom_traj = np.concatenate(atom_traj, axis=0)
-        # rigid_traj = np.concatenate(rigid_traj, axis=0)
-        
         atom_traj = torch.cat(atom_traj, dim=0)
         rigid_traj = torch.cat(rigid_traj, dim=0)
         if torch.is_tensor(atom_traj):
             atom_traj = atom_traj.detach().cpu().numpy()
         if torch.is_tensor(rigid_traj):
             rigid_traj = rigid_traj.detach().cpu().numpy()
-        
-        with nvtx_range("PDB_Writing_IO"):
+        if executor is not None:
+            executor.submit(
+                au.write_prot_to_pdb, 
+                prot_pos=atom_traj,
+                file_path=pdb_path,
+                aatype=aatype[0, 0],
+                no_indexing=True,
+                b_factors=b_factors
+            )
+        else:
             au.write_prot_to_pdb(
                 prot_pos=atom_traj,
                 file_path=pdb_path,
                 aatype=aatype[0, 0],
                 no_indexing=True,
-                b_factors=b_factors,
+                b_factors=b_factors
             )
     def _prepare_init_feats(self, valid_feats, device, frame_time, sample_length):
         """Prepare initial features for inference."""
