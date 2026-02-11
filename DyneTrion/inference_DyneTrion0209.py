@@ -18,6 +18,7 @@ from torch.utils import data
 from typing import Dict
 from contextlib import contextmanager
 import torch.cuda.nvtx as nvtx
+import concurrent.futures
 
 from src.data import DyneTrion_data_loader_dynamic
 from src.data import utils as du
@@ -89,8 +90,7 @@ class Evaluator:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        with nvtx_range("compile-time"):
-            self.model = torch.compile(self.model, dynamic=True) 
+        self.model = torch.compile(self.model, dynamic=True) 
         
         self.diffuser = self.exp.diffuser
 
@@ -114,10 +114,6 @@ class Evaluator:
         
         # 为预热准备“假噪声”
         f_time, l_len = warmup_feats['res_mask'].shape
-        # warmup_noise = {
-        #     'z_rot': torch.randn(100, f_time, l_len, 3, device=device),
-        #     'z_trans': torch.randn(100, f_time, l_len, 3, device=device)
-        # }
         z_rot_all = torch.randn(100, f_time, l_len, 3, device=self.device)
         z_trans_all = torch.randn(100, f_time, l_len, 3, device=self.device)
         # 调用干净的推理函数 (跑 2 步即可)
@@ -141,12 +137,13 @@ class Evaluator:
         # maybe add some func in the dateset class
         
         print("开始准备数据和预热...")
-        with nvtx_range("Data_Loading_And_Parsing"):
-            test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
+        # with nvtx_range("Data_Loading_And_Parsing"):
+        test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
         
         num_to_run = len(test_dataset)
         print(f"本次计划推理蛋白数量: {num_to_run}")
         
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         # seq_len 最大的索引
         current_batch_df = test_dataset.csv.iloc[:num_to_run]
         max_idx_in_batch = current_batch_df['seq_len'].idxmax()
@@ -167,16 +164,18 @@ class Evaluator:
             z_rot_all = torch.randn(100, f_time, l_len, 3, device=self.device)
             z_trans_all = torch.randn(100, f_time, l_len, 3, device=self.device)
             
-            self.exp.inference_fn(warmup_feats,num_t=2,min_t=0.01,aux_traj=True,
+            self.exp.inference_fn(warmup_feats,num_t=3,min_t=0.01,aux_traj=True,
                                   z_rot_all=z_rot_all,
                                   z_trans_all=z_trans_all
                                   )
             torch.cuda.synchronize()
             # torch.cuda.empty_cache() 
-        print("==== [Warmup] 预热成功，显存已锁定 ====")        
+        print("==== [Warmup] 预热成功，显存已锁定 ====")    
         
-        print("开始精准性能采集...")
-        torch.cuda.profiler.start()
+        future = executor.submit(test_dataset._get_row, 0)    
+        
+        # print("开始精准性能采集...")
+        # torch.cuda.profiler.start()
 
         eval_dir = self._output_dir
         os.makedirs(eval_dir, exist_ok=True)
@@ -193,22 +192,29 @@ class Evaluator:
         extrapolation_time = self.exp._conf.eval.extrapolation_time
         
         
-        for i in range(len(test_dataset)):
-            valid_feats, pdb_names = test_dataset._get_row(i)
+        for i in range(num_to_run):
+            # valid_feats, pdb_names = test_dataset._get_row(i)
+            valid_feats, pdb_names = future.result()
+            if i + 1 < num_to_run:
+                future = executor.submit(test_dataset._get_row, i + 1)
             for k,v in valid_feats.items():
-                valid_feats[k] = v.unsqueeze(0)
-            with nvtx_range(f"process_one_protein_extrapolation"):
-                self.exp._process_one_protein_extrapolation(
-                    extrapolation_time,
-                    valid_feats,
-                    [pdb_names],
-                    ref_base_path,
-                    pdb_base_path,
-                    device=self.device,
-                    noise_scale=self.exp._exp_conf.noise_scale,
-                )
-        torch.cuda.profiler.stop()
-        print("性能采集结束。")
+                # valid_feats[k] = v.unsqueeze(0)
+                valid_feats[k] = v.unsqueeze(0).to(self.device, non_blocking=True)
+            # nvtx.range_push("_process_one_protein_extrapolation")
+            self.exp._process_one_protein_extrapolation(
+                extrapolation_time,
+                valid_feats,
+                [pdb_names],
+                ref_base_path,
+                pdb_base_path,
+                device=self.device,
+                noise_scale=self.exp._exp_conf.noise_scale,
+                executor=executor,
+            )
+            # nvtx.range_pop()
+        # torch.cuda.profiler.stop()
+        executor.shutdown(wait=True)
+        # print("性能采集结束。")
 
 @hydra.main(version_base=None, config_path="./config", config_name="eval_DyneTrion")
 def run(conf: DictConfig) -> None:

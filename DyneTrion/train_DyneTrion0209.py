@@ -827,45 +827,44 @@ class Experiment:
         t_start = time.perf_counter()
         with torch.no_grad():
             # self-condition
-            nvtx.range_push("self_condition")
+            # nvtx.range_push("self_condition")
             if self._model_conf.embed.embed_self_conditioning and self_condition:
                 sample_feats['t'] = self.sc_t * t_placeholder
                 sample_feats['rot_score_scaling'] =self.sc_rot_scale * t_placeholder
                 sample_feats['trans_score_scaling'] = self.sc_trans_scale * t_placeholder
                 sample_feats = self._self_conditioning(sample_feats)
-            nvtx.range_pop()
+            # nvtx.range_pop()
             for step_idx, t in enumerate(reverse_steps):
                 # 内存地址冻结
                 rigids_buffer.copy_(current_rigid_obj.to_tensor_7().detach())
                 # model infer
-                nvtx.range_push("model_infer")
+                # nvtx.range_push("model_infer")
                 if step_idx < len(reverse_steps) - 1: 
                     sample_feats['t'] = t * t_placeholder
                     sample_feats['rot_score_scaling'] = all_rot_scales[step_idx] * t_placeholder
                     sample_feats['trans_score_scaling'] = all_trans_scales[step_idx] * t_placeholder
-                    nvtx.range_push("model_out")
+                    # nvtx.range_push("model_out")
                     model_out = self.model(sample_feats, is_training = self._exp_conf.training)
                     rot_score = model_out['rot_score']
                     trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
-                    nvtx.range_pop()
+                    # nvtx.range_pop()
                     # use CFG inference
-                    nvtx.range_push("cfg_inference")
-                    if self._conf.model.cfg_drop_rate > 0.01:
-                        model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
-                        trans_score_unref = model_out_uncond["trans_score"]
-                        rot_score_unref = model_out_uncond["rot_score"]
-                        cfg_gamma = self._conf.model.cfg_gamma
-                        trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
-                    nvtx.range_pop()
+                    # nvtx.range_push("cfg_inference")
+                    # if self._conf.model.cfg_drop_rate > 0.01:
+                    #     model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
+                    #     trans_score_unref = model_out_uncond["trans_score"]
+                    #     rot_score_unref = model_out_uncond["rot_score"]
+                    #     cfg_gamma = self._conf.model.cfg_gamma
+                    #     trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
+                    # nvtx.range_pop()
                     if self._model_conf.embed.embed_self_conditioning:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
                     diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
-                    nvtx.range_push("diffuser-reverse")
+                    # nvtx.range_push("diffuser-reverse")
                     with autocast(dtype=torch.bfloat16):
                         current_rigid_obj = self.diffuser.reverse(
-                            # rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
                             rigid_t=current_rigid_obj, 
                             rot_score=rot_score, 
                             trans_score=trans_score,
@@ -879,18 +878,18 @@ class Experiment:
                             noise_scale=noise_scale,
                             device=self.device
                         )
-                    nvtx.range_pop()                   
+                    # nvtx.range_pop()                   
                 else:
-                    nvtx.range_push("last-step-rigids")
+                    # nvtx.range_push("last-step-rigids")
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     current_rigid_obj = ru.Rigid.from_tensor_7_fast(model_out['rigids'])
-                nvtx.range_pop()
+                # nvtx.range_pop()
     
                 # post process
                 if aux_traj:
                     all_rigids.append(model_out['rigids'])
                 
-                nvtx.range_push("compute_backbone_atom37")
+                # nvtx.range_push("compute_backbone_atom37")
                 if step_idx == len(reverse_steps)-1:
                     angles = model_out['angles']
                     gt_trans_0 = sample_feats['rigids_t'][..., 4:]
@@ -902,7 +901,7 @@ class Experiment:
                         torsions = angles
                         )[0]
                     all_bb_prots.append(atom37_t)
-                nvtx.range_pop()
+                # nvtx.range_pop()
                 
         inference_time = time.perf_counter() - t_start
         print(f"inference_time:{inference_time:.2f} | num_t:{num_t} | noise_scale:{noise_scale}")
@@ -919,7 +918,7 @@ class Experiment:
             'prot_traj': all_bb_prots, # with reverse
             'rigid_traj': all_rigids
         }
-        nvtx.range_pop() 
+        # nvtx.range_pop() 
         return ret
     
     
@@ -1231,6 +1230,7 @@ class Experiment:
         min_t=None,
         num_t=None,
         noise_scale=1.0,
+        executor=None,
     ):
         """Process one protein sequence and perform trajectory extrapolation."""
         # === Preparation ===
@@ -1278,7 +1278,7 @@ class Experiment:
         
         for j in pbar:
             # === Perform inference ===
-            nvtx.range_push("inference_fn")
+            # nvtx.range_push("inference_fn")
             sample_out = self.inference_fn(
                 valid_feats,
                 num_t=num_t,
@@ -1288,14 +1288,14 @@ class Experiment:
                 z_rot_all=z_rot_all,
                 z_trans_all=z_trans_all,
             )
-            nvtx.range_pop()
+            # nvtx.range_pop()
             atom_pred = sample_out["prot_traj"][0]
             rigid_pred = sample_out["rigid_traj"][0]
             # Save the results
             atom_traj.append(atom_pred[-frame_time:])
             rigid_traj.append(rigid_pred[-frame_time:])
             # === Update reference state ===
-            nvtx.range_push("_update_ref_with_prediction")
+            # nvtx.range_push("_update_ref_with_prediction")
             valid_feats['rigids_t'] = all_start_rigids[j]
             valid_feats = self._update_ref_with_prediction(
                 valid_feats,
@@ -1305,23 +1305,33 @@ class Experiment:
                 motion_number,
                 device,
             )
-            nvtx.range_pop()
+            # nvtx.range_pop()
         # === Concatenate trajectory and save ===
-        nvtx.range_push("save-PDB_Writing_IO")
+        # nvtx.range_push("save-PDB_Writing_IO")
         atom_traj = torch.cat(atom_traj, dim=0)
         rigid_traj = torch.cat(rigid_traj, dim=0)
         if torch.is_tensor(atom_traj):
             atom_traj = atom_traj.detach().cpu().numpy()
         if torch.is_tensor(rigid_traj):
             rigid_traj = rigid_traj.detach().cpu().numpy()
-        au.write_prot_to_pdb(
-            prot_pos=atom_traj,
-            file_path=pdb_path,
-            aatype=aatype[0, 0],
-            no_indexing=True,
-            b_factors=b_factors,
-        )
-        nvtx.range_pop()
+        if executor is not None:
+            executor.submit(
+                au.write_prot_to_pdb, 
+                prot_pos=atom_traj,
+                file_path=pdb_path,
+                aatype=aatype[0, 0],
+                no_indexing=True,
+                b_factors=b_factors
+            )
+        else:
+            au.write_prot_to_pdb(
+                prot_pos=atom_traj,
+                file_path=pdb_path,
+                aatype=aatype[0, 0],
+                no_indexing=True,
+                b_factors=b_factors
+            )
+        # nvtx.range_pop()
         
     def _prepare_init_feats(self, valid_feats, device, frame_time, sample_length):
         """Prepare initial features for inference."""
