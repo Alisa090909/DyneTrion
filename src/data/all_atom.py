@@ -9,16 +9,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Rigid = ru.Rigid
 Rotation = ru.Rotation
 
-IDEALIZED_POS37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device)
+IDEALIZED_POS37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device).float()
 IDEALIZED_POS37_MASK = torch.any(IDEALIZED_POS37, axis=-1).to(device)
-IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions).to(device)
-DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame).to(device)
-ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask).to(device)
-GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group).to(device)
+IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions).to(device).float()
+DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame).to(device).float()
+ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask).to(device).float()
+GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group).to(device).long()
 
-GROUP_IDX_37 = torch.tensor(residue_constants.restype_atom37_to_rigid_group).to(device)
-ATOM_MASK_37 = torch.tensor(residue_constants.restype_atom37_mask).to(device)
-IDEALIZED_POS_37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device)
+GROUP_IDX_37 = torch.tensor(residue_constants.restype_atom37_to_rigid_group).to(device).long()
+ATOM_MASK_37 = torch.tensor(residue_constants.restype_atom37_mask).to(device).float()
+IDEALIZED_POS_37 = torch.tensor(residue_constants.restype_atom37_rigid_group_positions).to(device).float()
 
 
 def torsion_angles_to_frames(
@@ -187,68 +187,38 @@ def compute_backbone_atom37(bb_rigids,aatypes, torsions):
         bb_rigids,
         torsion_angles,
         aatype,
-        DEFAULT_FRAMES.to(bb_rigids.device))# [*, N, 37]
+        DEFAULT_FRAMES)# [*, N, 37]
     
     atom37_bb_pos = frames_to_atom37_pos(all_frames,aatype)
 
-    atom37_mask = torch.any(atom37_bb_pos, axis=-1)
+    atom37_mask = (torch.sum(torch.abs(atom37_bb_pos), dim=-1) > 1e-6).float()
 
     return atom37_bb_pos, atom37_mask, aatype,0
 
-# @torch.compile  # 不能调整，torch.compile和OpenFold不兼容
-# def compute_backbone_atom37(bb_rigids, aatypes, torsions):
+def frames_to_atom37_pos(r: Rigid, aatype: torch.Tensor):
+    """
+    使用索引查找代替 one_hot 乘法。
+    """
+    group_idx = GROUP_IDX_37[aatype] 
+
+    r_tensor = r.to_tensor_7() # [frame_time, L, 8, 7]
     
-#     device = bb_rigids.device # 获取当前 GPU 设备
-#     torsion_angles = torsions.to(device)
-#     aatype = aatypes.long().to(device) # 确保 aatype 也在 GPU 上
-
-#     # 这里的 feats.torsion_angles_to_frames 是 OpenFold 的复杂逻辑
-#     # 嵌套在 @torch.compile 下，它内部的所有碎步骤都会被一起优化
-#     all_frames = feats.torsion_angles_to_frames(
-#         bb_rigids,
-#         torsion_angles,
-#         aatype,
-#         DEFAULT_FRAMES.to(device) # 使用预备好的 GPU 常量
-#     )
+    gather_idx = group_idx.unsqueeze(-1).expand(-1, -1, -1, 7)
     
-#     # 这一步同样是几何变换，也被 compile 包裹了
-#     atom37_bb_pos = frames_to_atom37_pos(all_frames, aatype)
-#     atom37_mask = torch.any(atom37_bb_pos, axis=-1)
+    selected_frames_t7 = torch.gather(r_tensor, 2, gather_idx)
+    
+    selected_frames = ru.Rigid.from_tensor_7_fast(selected_frames_t7)
 
-#     return atom37_bb_pos, atom37_mask, aatype, 0
+    # IDEALIZED_POS_37 shape: [21, 37, 3] -> [frame_time, L, 37, 3]
+    frame_null_pos = IDEALIZED_POS_37[aatype]
+    
+    pred_positions = selected_frames.apply(frame_null_pos)
 
-def frames_to_atom37_pos(
-        r: Rigid,
-        aatype: torch.Tensor,
-    ):
-    # [*, N, 37]
-    aatype = aatype.cpu()
-    # aatype = aatype.to(r.device)
-    group_mask = GROUP_IDX_37[aatype, ...]
-
-    # [*, N, 37, 8]
-    group_mask = torch.nn.functional.one_hot(
-        group_mask,
-        num_classes=DEFAULT_FRAMES.shape[-3],
-    ).to(r.device)
-
-    # [*, N, 37, 8]
-    t_atoms_to_global = r[..., None, :] * group_mask
-    # print(t_atoms_to_global)
-    # [*, N, 37]
-    t_atoms_to_global = t_atoms_to_global.map_tensor_fn(
-        lambda x: torch.sum(x, dim=-1)
-    )
-
-    # [*, N, 37, 1]
-    frame_atom_mask = ATOM_MASK_37[aatype, ...].unsqueeze(-1).to(r.device)
-
-    # [*, N, 37, 3]
-    frame_null_pos = IDEALIZED_POS_37[aatype, ...].to(r.device)
-    pred_positions = t_atoms_to_global.apply(frame_null_pos)
+    frame_atom_mask = ATOM_MASK_37[aatype].unsqueeze(-1)
     pred_positions = pred_positions * frame_atom_mask
 
     return pred_positions
+
 
 def calculate_neighbor_angles(R_ac, R_ab):
     """Calculate angles between atoms c <- a -> b.

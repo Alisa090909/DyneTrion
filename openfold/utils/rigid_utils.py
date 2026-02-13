@@ -331,12 +331,6 @@ class Rotation:
                 "Incorrectly shaped rotation matrix or quaternion"
             )
 
-        # Force full-precision
-        if(quats is not None):
-            quats = quats.type(torch.float32)
-        if(rot_mats is not None):
-            rot_mats = rot_mats.type(torch.float32)
-
         if(quats is not None and normalize_quats):
             quats = quats / torch.linalg.norm(quats, dim=-1, keepdim=True)
 
@@ -968,6 +962,13 @@ class Rigid:
             self._rots[index],
             self._trans[index + (slice(None),)],
         )
+        
+    @staticmethod
+    def from_tensor_7_fast(t):
+        return Rigid(
+            Rotation(quats=t[..., :4], normalize_quats=False), 
+            t[..., 4:]
+        )
 
     def __mul__(self,
         right: torch.Tensor,
@@ -1044,6 +1045,10 @@ class Rigid:
                 The stored translation
         """
         return self._trans
+    
+    def get_quats(self) -> torch.Tensor:
+        """快捷获取四元数张量"""
+        return self._rots.get_quats()
 
     def compose_q_update_vec(self, 
         q_update_vec: torch.Tensor,
@@ -1206,19 +1211,23 @@ class Rigid:
         
         return Rigid(rots, trans)
 
+    # def to_tensor_7(self) -> torch.Tensor:
+    #     """
+    #         Converts a transformation to a tensor with 7 final columns, four 
+    #         for the quaternion followed by three for the translation.
+
+    #         Returns:
+    #             A [*, 7] tensor representation of the transformation
+    #     """
+    #     tensor = self._trans.new_zeros((*self.shape, 7))
+    #     tensor[..., :4] = self._rots.get_quats()
+    #     tensor[..., 4:] = self._trans
+
+    #     return tensor
+    
     def to_tensor_7(self) -> torch.Tensor:
-        """
-            Converts a transformation to a tensor with 7 final columns, four 
-            for the quaternion followed by three for the translation.
-
-            Returns:
-                A [*, 7] tensor representation of the transformation
-        """
-        tensor = self._trans.new_zeros((*self.shape, 7))
-        tensor[..., :4] = self._rots.get_quats()
-        tensor[..., 4:] = self._trans
-
-        return tensor
+        # 直接 cat 两个属性
+        return torch.cat([self._rots.get_quats(), self._trans], dim=-1)
 
     @staticmethod
     def from_tensor_7(

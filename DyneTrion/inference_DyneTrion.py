@@ -51,10 +51,6 @@ class Evaluator:
         self._exp_conf = conf.experiment
 
         # Set-up GPU
-        # if torch.cuda.is_available():
-        #     self.device = 'cuda:0'
-        # else:
-        #     self.device = 'cpu'
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self._conf.experiment.device = self.device
         self._log.info(f'Using device: {self.device}')
@@ -111,49 +107,70 @@ class Evaluator:
             grouped=self._conf.eval.group,
         )
         return test_dataset
+    
+    def warmup_model(self, warmup_feats, device):
+        
+        print("==== [Warmup] 正在初始化计算图和显存池... ====")
+        
+        f_time, l_len = warmup_feats['res_mask'].shape
+        z_rot_all = torch.randn(100, f_time, l_len, 3, device=self.device)
+        z_trans_all = torch.randn(100, f_time, l_len, 3, device=self.device)
+        with torch.no_grad():
+            self.inference_fn(
+                warmup_feats, 
+                num_t=2, 
+                min_t=0.01, 
+                aux_traj=True, 
+                # precomputed_noises=warmup_noise
+                z_rot_all=z_rot_all,
+                z_trans_all=z_trans_all
+            )
+            torch.cuda.synchronize()
+            # torch.cuda.empty_cache() 
+        print("==== [Warmup] 预热成功，显存已锁定 ====")
 
     def start_evaluation(self):
         # define data process
         # we need to call the MD simulation to get the data
         # maybe add some func in the dateset class
-        print("开始精准性能采集...")
-        # torch.cuda.profiler.start()
         
-        # with nvtx_range("Data_Loading_And_Parsing"):
+        print("开始准备数据和预热...")
         test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
-        
         
         num_to_run = len(test_dataset)
         print(f"本次计划推理蛋白数量: {num_to_run}")
         
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-
+        # seq_len 最大的索引
         current_batch_df = test_dataset.csv.iloc[:num_to_run]
         max_idx_in_batch = current_batch_df['seq_len'].idxmax()
         max_len = current_batch_df['seq_len'].max()
         pdb_id_of_max = current_batch_df.loc[max_idx_in_batch, 'pdb_id']
-        
         relative_idx = current_batch_df.index.get_loc(max_idx_in_batch)
 
         print(f"==== 预热：使用本次批次中最长的蛋白 [ID: {pdb_id_of_max}, 长度: {max_len}] ====")
 
-        future = executor.submit(test_dataset._get_row, 0)   
-
-        # 进行极限预热
+        # warmup 2 steps
         with torch.no_grad():
-            max_feats, _ = test_dataset._get_row(relative_idx)
-            for k, v in max_feats.items():
+            warmup_feats, _ = test_dataset._get_row(relative_idx)
+            for k, v in warmup_feats.items():
                 if torch.is_tensor(v):
-                    max_feats[k] = v.to(self.device)
-            f_time, l_len = max_feats['res_mask'].shape
+                    warmup_feats[k] = v.to(self.device)
+                    
+            f_time, l_len = warmup_feats['res_mask'].shape
             z_rot_all = torch.randn(100, f_time, l_len, 3, device=self.device)
             z_trans_all = torch.randn(100, f_time, l_len, 3, device=self.device)
             
-            self.exp.inference_fn(max_feats,num_t=2,min_t=0.01,aux_traj=True,)
+            self.exp.inference_fn(warmup_feats,num_t=2,min_t=0.01,aux_traj=True,
+                                  z_rot_all=z_rot_all,
+                                  z_trans_all=z_trans_all
+                                  )
             torch.cuda.synchronize()
-            # torch.cuda.empty_cache() # 预热完清一下碎片
-        print("==== [Warmup] 预热成功，显存已锁定 ====")  
+            # torch.cuda.empty_cache() 
+        print("==== [Warmup] 预热成功，显存已锁定 ====")    
         
+        future = executor.submit(test_dataset._get_row, 0)    
+
         eval_dir = self._output_dir
         os.makedirs(eval_dir, exist_ok=True)
         ic(eval_dir)
@@ -167,14 +184,14 @@ class Evaluator:
         self.exp._set_seed(42)
         pdb_base_path, ref_base_path = self.exp._prepare_extension_eval_dirs(eval_dir)
         extrapolation_time = self.exp._conf.eval.extrapolation_time
-        for i in range(len(test_dataset)):
-            # valid_feats, pdb_names = test_dataset._get_row(i)
+        
+        
+        for i in range(num_to_run):
             valid_feats, pdb_names = future.result()
             if i + 1 < num_to_run:
                 future = executor.submit(test_dataset._get_row, i + 1)
             for k,v in valid_feats.items():
-                valid_feats[k] = v.unsqueeze(0)
-            # nvtx.range_push("_process_one_protein_extrapolation")
+                valid_feats[k] = v.unsqueeze(0).to(self.device, non_blocking=True)
             self.exp._process_one_protein_extrapolation(
                 extrapolation_time,
                 valid_feats,
@@ -185,10 +202,7 @@ class Evaluator:
                 noise_scale=self.exp._exp_conf.noise_scale,
                 executor=executor,
             )
-            # nvtx.range_pop()
-        # torch.cuda.profiler.stop()
         executor.shutdown(wait=True)
-        print("性能采集结束。")
 
 @hydra.main(version_base=None, config_path="./config", config_name="eval_DyneTrion")
 def run(conf: DictConfig) -> None:

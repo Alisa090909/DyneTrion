@@ -110,7 +110,7 @@ class R3Diffuser:
     def score_scaling(self, t):
         return 1 / torch.sqrt(self.conditional_var(t, use_torch=True))
 
-    def reverse(self, *, x_t, score_t, t, dt, sqrt_dt, mask=None, center=True, noise_scale=1.0):
+    def reverse(self, *, x_t, score_t, t, dt, sqrt_dt, z,mask=None, center=True, noise_scale=1.0):
         """Simulates the reverse SDE for 1 step
 
         Args:
@@ -132,10 +132,7 @@ class R3Diffuser:
         beta_curr = self.b_t(t)
         g_t = torch.sqrt(beta_curr)
         f_t = -0.5 * beta_curr * x_t
-        
-        z = noise_scale * torch.randn_like(score_t)
-        
-        # 计算扰动
+
         perturb = (f_t - beta_curr * score_t) * dt + g_t * sqrt_dt * z
 
         if mask is not None:
@@ -148,9 +145,8 @@ class R3Diffuser:
         if center:
             mask_sum = torch.sum(mask, dim=-1, keepdim=True)
             com = torch.sum(x_t_1, dim=-2) / (mask_sum + 1e-10)
-            x_t_1 -= com.unsqueeze(-2) # 自动对齐维度
+            x_t_1 -= com.unsqueeze(-2) 
     
-        # 反缩放并返回
         return x_t_1 / self._scaling_t
 
     def conditional_var(self, t, use_torch=True):
