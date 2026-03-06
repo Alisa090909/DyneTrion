@@ -183,9 +183,6 @@ _QTR_MAT[..., 2, 2] = _to_mat([("aa", 1), ("bb", -1), ("cc", -1), ("dd", 1)])
 _QTR_MAT = torch.tensor(_QTR_MAT, dtype=torch.float32)
 
 def quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
-    """
-    使用代数公式直接计算四元数到旋转矩阵的转换。
-    """
     w, x, y, z = torch.unbind(quat, dim=-1)
     
     x2 = x * x
@@ -1209,7 +1206,6 @@ class Rigid:
         return Rigid(rots, trans)
     
     def to_tensor_7(self) -> torch.Tensor:
-        # 直接 cat 两个属性
         return torch.cat([self._rots.get_quats(), self._trans], dim=-1)
 
     @staticmethod
@@ -1242,7 +1238,7 @@ class Rigid:
 
         e0 = v1 / (torch.norm(v1, dim=-1, keepdim=True) + eps)
 
-        # 施密特正交化
+        # the Gram-Schmidt algorithm
         dot = torch.sum(e0 * v2, dim=-1, keepdim=True)
         v2_orthogonal = v2 - e0 * dot
         e1 = v2_orthogonal / (torch.norm(v2_orthogonal, dim=-1, keepdim=True) + eps)
