@@ -9,7 +9,7 @@ n_frame=16
 extrapolation_time=16
 
 test_data=datasets/inference/inference_data.csv
-max_protein_num=10
+max_protein_num=100
 train_step=400000 
 
 model_path=./dynamicPDB/DyneTrion/step_400000.pth

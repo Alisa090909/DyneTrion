@@ -18,19 +18,12 @@ from torch.utils import data
 from typing import Dict
 from contextlib import contextmanager
 import torch.cuda.nvtx as nvtx
+import torch.cuda.profiler as profiler
 import concurrent.futures
 
 from src.data import DyneTrion_data_loader_dynamic
 from src.data import utils as du
 import DyneTrion.train_DyneTrion as train_DyneTrion
-
-@contextmanager
-def nvtx_range(name):
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
 
 class Evaluator:
     def __init__(
@@ -188,6 +181,8 @@ class Evaluator:
         
         for i in range(num_to_run):
             valid_feats, pdb_names = future.result()
+            seq_len = valid_feats['aatype'].shape[-1]
+            print(f"\n>>>> [Progress: {i+1}] Processing PDB: {pdb_names} | Length: {seq_len} <<<<")
             if i + 1 < num_to_run:
                 future = executor.submit(test_dataset._get_row, i + 1)
             for k,v in valid_feats.items():

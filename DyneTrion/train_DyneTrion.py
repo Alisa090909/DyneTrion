@@ -54,14 +54,6 @@ from src.toolbox.rot_trans_error import (
     average_translation_distances,
 )
 
-@contextmanager
-def nvtx_range(name):
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
-
 class Experiment:
 
     def __init__(
@@ -857,7 +849,7 @@ class Experiment:
                             center=center,
                             noise_scale=noise_scale,
                             device=self.device
-                        )                 
+                        )              
                 else:
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
                     current_rigid_obj = ru.Rigid.from_tensor_7_fast(model_out['rigids'])

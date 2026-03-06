@@ -182,30 +182,27 @@ _QTR_MAT[..., 2, 2] = _to_mat([("aa", 1), ("bb", -1), ("cc", -1), ("dd", 1)])
 
 _QTR_MAT = torch.tensor(_QTR_MAT, dtype=torch.float32)
 
-
 def quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
     """
-        Converts a quaternion to a rotation matrix.
-
-        Args:
-            quat: [*, 4] quaternions
-        Returns:
-            [*, 3, 3] rotation matrices
+    使用代数公式直接计算四元数到旋转矩阵的转换。
     """
-    # [*, 4, 4]
-    quat = quat[..., None] * quat[..., None, :]
-
-    # [4, 4, 3, 3]
-    # mat = quat.new_tensor(_QTR_MAT, requires_grad=False)
-    mat = _QTR_MAT.to(device=quat.device, dtype=quat.dtype)
-
-    # [*, 4, 4, 3, 3]
-    shaped_qtr_mat = mat.view((1,) * len(quat.shape[:-2]) + mat.shape)
-    quat = quat[..., None, None] * shaped_qtr_mat
-
-    # [*, 3, 3]
-    return torch.sum(quat, dim=(-3, -4))
-
+    w, x, y, z = torch.unbind(quat, dim=-1)
+    
+    x2 = x * x
+    y2 = y * y
+    z2 = z * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    xw = x * w
+    yw = y * w
+    zw = z * w
+    
+    row0 = torch.stack([1 - 2 * (y2 + z2), 2 * (xy - zw), 2 * (xz + yw)], dim=-1)
+    row1 = torch.stack([2 * (xy + zw), 1 - 2 * (x2 + z2), 2 * (yz - xw)], dim=-1)
+    row2 = torch.stack([2 * (xz - yw), 2 * (yz + xw), 1 - 2 * (x2 + y2)], dim=-1)
+    
+    return torch.stack([row0, row1, row2], dim=-2)
 
 def rot_to_quat(
     rot: torch.Tensor,
@@ -1210,20 +1207,6 @@ class Rigid:
         trans = t[..., :3, 3]
         
         return Rigid(rots, trans)
-
-    # def to_tensor_7(self) -> torch.Tensor:
-    #     """
-    #         Converts a transformation to a tensor with 7 final columns, four 
-    #         for the quaternion followed by three for the translation.
-
-    #         Returns:
-    #             A [*, 7] tensor representation of the transformation
-    #     """
-    #     tensor = self._trans.new_zeros((*self.shape, 7))
-    #     tensor[..., :4] = self._rots.get_quats()
-    #     tensor[..., 4:] = self._trans
-
-    #     return tensor
     
     def to_tensor_7(self) -> torch.Tensor:
         # 直接 cat 两个属性
@@ -1246,7 +1229,7 @@ class Rigid:
         )
 
         return Rigid(rots, trans)
-
+    
     @staticmethod
     def from_3_points(
         p_neg_x_axis: torch.Tensor, 
@@ -1254,43 +1237,22 @@ class Rigid:
         p_xy_plane: torch.Tensor, 
         eps: float = 1e-8
     ):
-        """
-            Implements algorithm 21. Constructs transformations from sets of 3 
-            points using the Gram-Schmidt algorithm.
+        v1 = origin - p_neg_x_axis  
+        v2 = p_xy_plane - origin
 
-            Args:
-                p_neg_x_axis: [*, 3] coordinates
-                origin: [*, 3] coordinates used as frame origins
-                p_xy_plane: [*, 3] coordinates
-                eps: Small epsilon value
-            Returns:
-                A transformation object of shape [*]
-        """
-        p_neg_x_axis = torch.unbind(p_neg_x_axis, dim=-1)
-        origin = torch.unbind(origin, dim=-1)
-        p_xy_plane = torch.unbind(p_xy_plane, dim=-1)
+        e0 = v1 / (torch.norm(v1, dim=-1, keepdim=True) + eps)
 
-        e0 = [c1 - c2 for c1, c2 in zip(origin, p_neg_x_axis)]
-        e1 = [c1 - c2 for c1, c2 in zip(p_xy_plane, origin)]
+        # 施密特正交化
+        dot = torch.sum(e0 * v2, dim=-1, keepdim=True)
+        v2_orthogonal = v2 - e0 * dot
+        e1 = v2_orthogonal / (torch.norm(v2_orthogonal, dim=-1, keepdim=True) + eps)
 
-        denom = torch.sqrt(sum((c * c for c in e0)) + eps)
-        e0 = [c / denom for c in e0]
-        dot = sum((c1 * c2 for c1, c2 in zip(e0, e1)))
-        e1 = [c2 - c1 * dot for c1, c2 in zip(e0, e1)]
-        denom = torch.sqrt(sum((c * c for c in e1)) + eps)
-        e1 = [c / denom for c in e1]
-        e2 = [
-            e0[1] * e1[2] - e0[2] * e1[1],
-            e0[2] * e1[0] - e0[0] * e1[2],
-            e0[0] * e1[1] - e0[1] * e1[0],
-        ]
+        e2 = torch.cross(e0, e1, dim=-1)
 
-        rots = torch.stack([c for tup in zip(e0, e1, e2) for c in tup], dim=-1)
-        rots = rots.reshape(rots.shape[:-1] + (3, 3))
+        rots = torch.stack([e0, e1, e2], dim=-1)
 
         rot_obj = Rotation(rot_mats=rots, quats=None)
-
-        return Rigid(rot_obj, torch.stack(origin, dim=-1))
+        return Rigid(rot_obj, origin)
 
     def unsqueeze(self, 
         dim: int,
