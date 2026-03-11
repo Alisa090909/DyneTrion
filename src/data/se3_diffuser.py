@@ -1,7 +1,7 @@
 """SE(3) diffusion methods."""
 import numpy as np
-from src.data import so3_diffuser
-from src.data import r3_diffuser
+from src.data import so3_diffuser as so3_diffuser
+from src.data import r3_diffuser as r3_diffuser
 from scipy.spatial.transform import Rotation
 from openfold.utils import rigid_utils as ru
 from src.data import utils as du
@@ -158,7 +158,7 @@ class SE3Diffuser:
         trans_score_scaling = self._r3_diffuser.score_scaling(t)
         return rot_score_scaling, trans_score_scaling
 
-    def reverse(self, rigid_t, rot_score, trans_score, t, dt,sqrt_dt,diffuse_mask=None, center=True, noise_scale=1.0, device=None):
+    def reverse(self, rigid_t, rot_score, trans_score, t, dt,sqrt_dt,z_rot, z_trans,diffuse_mask=None, center=True, noise_scale=1.0, device=None):
         
         if device is None:
             device = rigid_t.device 
@@ -171,6 +171,7 @@ class SE3Diffuser:
             t=t,
             dt=dt,
             sqrt_dt=sqrt_dt,
+            z=z_rot,
             noise_scale=noise_scale,
         )
         
@@ -180,6 +181,7 @@ class SE3Diffuser:
             t=t,
             dt=dt,
             sqrt_dt=sqrt_dt,
+            z=z_trans,
             center=center,
             noise_scale=noise_scale
         )
@@ -253,5 +255,4 @@ class SE3Diffuser:
             for i in range(frame_time):
                 rigids_t.append(_assemble_rigid(rot_ref[i], trans_ref[i]).to_tensor_7())
             rigids_t = torch.stack(rigids_t,dim=0)
-            # rigids_t = ru.Rigid.from_tensor_7(rigids_t)
         return {'rigids_t': rigids_t}

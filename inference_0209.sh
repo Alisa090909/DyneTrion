@@ -9,8 +9,8 @@ n_frame=16
 extrapolation_time=16
 
 test_data=datasets/inference/inference_data.csv
-max_protein_num=100
-train_step=400000 
+max_protein_num=3
+train_step=400000
 
 model_path=./dynamicPDB/DyneTrion/step_400000.pth
 
@@ -19,7 +19,7 @@ save_root=${project_root}/inference_${TIMESTAMP}/
 
 echo "Results will be saved to: ${save_root}"
 
-time CUDA_VISIBLE_DEVICES=0 python -m DyneTrion.inference_DyneTrion eval.weights_path=${model_path} \
+time CUDA_VISIBLE_DEVICES=0 python -m DyneTrion.inference_DyneTrion0209 eval.weights_path=${model_path} \
 experiment.use_ddp=False \
 eval.extrapolation_time=${extrapolation_time} \
 eval.name="test" \

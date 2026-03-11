@@ -12,6 +12,7 @@ from src.data import all_atom
 import torch.nn.functional as F
 import inspect
 import sys
+import torch.cuda.nvtx as nvtx
 
 import torch.utils.checkpoint as cp
 
@@ -312,6 +313,7 @@ class InvariantPointAttention(nn.Module):
         # TODO: Remove after published checkpoint is updated without these weights.
         self.linear_rbf = Linear(20, 1)
 
+    @torch.compile(dynamic=True)
     def forward(
         self,
         s: torch.Tensor,
@@ -402,13 +404,13 @@ class InvariantPointAttention(nn.Module):
         a *= math.sqrt(1.0 / (3 * self.c_hidden))
         a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
 
-        # [*, N_res, N_res, H, P_q, 3]
-        pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-        
-        pt_att = pt_displacement ** 2
+        q_pts_sq = torch.sum(q_pts ** 2, dim=-1)
+        k_pts_sq = torch.sum(k_pts ** 2, dim=-1)
 
-        # [*, N_res, N_res, H, P_q]
-        pt_att = sum(torch.unbind(pt_att, dim=-1))
+        dot_prod = torch.einsum('...iqpc,...jqpc->...ijqp', q_pts, k_pts)
+
+        pt_att = q_pts_sq.unsqueeze(-3) + k_pts_sq.unsqueeze(-4) - 2 * dot_prod
+        
         head_weights = self.softplus(self.head_weights).view(
             *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
         )
@@ -823,7 +825,7 @@ class DFOLDIpaScore(nn.Module):
                 seq_tfmr_out = seq_tfmr_out.permute([1,0,2])
                 # residul connection, post_tfmr_temporal_ is zero-initialized
                 temporal_node = temporal_node + self.trunk[f'post_tfmr_temporal_{b}'](seq_tfmr_out)
-                frame_node = temporal_node[self.motion_number:] 
+                frame_node = temporal_node[self.motion_number:]
 
             # apply MLP for node features
             all_node = self.trunk[f'node_transition_{b}'](torch.cat([motion_node,ref_node,frame_node],dim=0))
@@ -856,7 +858,7 @@ class DFOLDIpaScore(nn.Module):
         )
         trans_score = trans_score * node_mask[..., None]
         # directly predict the angles for side chains with the last layer  node features
-
+        
         unorm_angles, angles = self.angle_resnet(frame_node, frame_node_init)
         # merge the outputs 
         model_out = {

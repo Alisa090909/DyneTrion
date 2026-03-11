@@ -42,10 +42,9 @@ from openfold.utils import rigid_utils as ru
 from openfold.utils.loss import lddt_ca, torsion_angle_loss
 from src.data import DyneTrion_data_loader_dynamic
 from src.analysis import utils as au
-# from src.data import se3_diffuser, all_atom
 
-from src.data import se3_diffuser
-from src.data import all_atom_zxm as all_atom
+from src.data import se3_diffuser as se3_diffuser
+from src.data import all_atom as all_atom
 
 from src.data import utils as du
 from src.experiments import utils as eu
@@ -54,14 +53,6 @@ from src.toolbox.rot_trans_error import (
     average_quaternion_distances,
     average_translation_distances,
 )
-
-@contextmanager
-def nvtx_range(name):
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
 
 class Experiment:
 
@@ -90,8 +81,6 @@ class Experiment:
         self._use_ddp = self._exp_conf.use_ddp
         self.dt_string = datetime.now().strftime("%dD_%mM_%YY_%Hh_%Mm_%Ss")
         
-        # 接收注入的设备信息，并包装成 torch.device 对象
-        # 包装一下是为了后续调用 .type() 或某些算子时更稳定
         self.device = torch.device(self._conf.experiment.device)
         
         # 1. initialize ddp info if in ddp mode
@@ -155,6 +144,18 @@ class Experiment:
         
         self.diffuser._so3_diffuser.to_device(self.device)
         self.diffuser._r3_diffuser.to_device(self.device)
+        
+        # pre-compute Scaling
+        with torch.no_grad():
+
+            all_rot_s, all_trans_s = self.diffuser.score_scaling(self.reverse_steps)
+            
+            self.all_rot_scales = all_rot_s.to(self.device)   # [100]
+            self.all_trans_scales = all_trans_s.to(self.device) # [100]
+            
+            self.sc_rot_scale = self.all_rot_scales[0]
+            self.sc_trans_scale = self.all_trans_scales[0]
+            self.sc_t = self.reverse_steps[0]
         
         
     def _init_best_eval(self):
@@ -773,6 +774,8 @@ class Experiment:
             aux_traj=False,
             self_condition=True,
             noise_scale=1.0,
+            z_rot_all=None,
+            z_trans_all=None,
         ):
         """Inference function.
 
@@ -781,93 +784,105 @@ class Experiment:
         """
         self._model.eval()
         # Run reverse process.
-        # sample_feats = copy.deepcopy(data_init)
         sample_feats = {k: v for k, v in data_init.items()} 
-        device = sample_feats['rigids_t'].device
+        
+        # memory freezing
+        rigids_buffer = sample_feats['rigids_t'].clone().contiguous()
+        sample_feats['rigids_t'] = rigids_buffer 
 
+        device = self.device
         reverse_steps = self.reverse_steps 
         t_placeholder = self.t_placeholder
+        all_rot_scales = self.all_rot_scales
+        all_trans_scales = self.all_trans_scales
+        
+        num_t = num_t if num_t is not None else self.num_t
+        min_t = min_t if min_t is not None else self._data_conf.min_t
+        
+        # init rigids_t
+        current_rigid_obj = ru.Rigid.from_tensor_7_fast(sample_feats['rigids_t'])
+        
         all_rigids = []
         all_bb_prots = []
         t_start = time.perf_counter()
         with torch.no_grad():
             # self-condition
-            nvtx.range_push("self_condition")
             if self._model_conf.embed.embed_self_conditioning and self_condition:
-                sample_feats = self._set_t_feats(sample_feats, reverse_steps[0], t_placeholder)
+                sample_feats['t'] = self.sc_t * t_placeholder
+                sample_feats['rot_score_scaling'] =self.sc_rot_scale * t_placeholder
+                sample_feats['trans_score_scaling'] = self.sc_trans_scale * t_placeholder
                 sample_feats = self._self_conditioning(sample_feats)
-            nvtx.range_pop()
             for step_idx, t in enumerate(reverse_steps):
+                # memory freezing
+                rigids_buffer.copy_(current_rigid_obj.to_tensor_7().detach())
                 # model infer
-                nvtx.range_push("model_infer")
-                # if t > min_t:
                 if step_idx < len(reverse_steps) - 1: 
-                    sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
+                    sample_feats['t'] = t * t_placeholder
+                    sample_feats['rot_score_scaling'] = all_rot_scales[step_idx] * t_placeholder
+                    sample_feats['trans_score_scaling'] = all_trans_scales[step_idx] * t_placeholder
                     model_out = self.model(sample_feats, is_training = self._exp_conf.training)
-                    # rot_score = model_out['rot_score']
-                    # trans_score = model_out['trans_score']
+                    rot_score = model_out['rot_score']
+                    trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
                     # use CFG inference
-                    # nvtx.range_push("cfg_inference")
                     # if self._conf.model.cfg_drop_rate > 0.01:
                     #     model_out_uncond = self.model(sample_feats,drop_ref = True,is_training = self._exp_conf.training)
                     #     trans_score_unref = model_out_uncond["trans_score"]
                     #     rot_score_unref = model_out_uncond["rot_score"]
                     #     cfg_gamma = self._conf.model.cfg_gamma
                     #     trans_score = trans_score_unref + cfg_gamma*(trans_score-trans_score_unref)
-                    # nvtx.range_pop()
-
-                    nvtx.range_push("update_and_generate")
                     if self._model_conf.embed.embed_self_conditioning:
                         sample_feats['sc_ca_t'] = rigid_pred[..., 4:]
                     fixed_mask = sample_feats['fixed_mask'] * sample_feats['res_mask']
                     diffuse_mask = (1 - sample_feats['fixed_mask']) * sample_feats['res_mask']
                     with autocast(dtype=torch.bfloat16):
-                        rigids_t = self.diffuser.reverse(
-                            rigid_t=ru.Rigid.from_tensor_7(sample_feats['rigids_t']),
-                            rot_score=model_out['rot_score'], 
-                            trans_score=model_out['trans_score'],
-                            diffuse_mask=sample_feats['res_mask'], # 确保是 Tensor
+                        current_rigid_obj = self.diffuser.reverse(
+                            rigid_t=current_rigid_obj, 
+                            rot_score=rot_score, 
+                            trans_score=trans_score,
+                            diffuse_mask=sample_feats['res_mask'],
                             t=t, 
                             dt=self.dt,
                             sqrt_dt=self.sqrt_dt,
+                            z_rot=z_rot_all[step_idx],   
+                            z_trans=z_trans_all[step_idx], 
                             center=center,
                             noise_scale=noise_scale,
-                            device=device
-                        )
-                    nvtx.range_pop()                   
+                            device=self.device
+                        )              
                 else:
-                    # 这是最后一步 (t 等于 min_t)
                     model_out = self.model(sample_feats,is_training = self._exp_conf.training)
-                    rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
-                sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
-                infer_end_time = time.time()
-                nvtx.range_pop() 
+                    current_rigid_obj = ru.Rigid.from_tensor_7_fast(model_out['rigids'])
+    
                 # post process
                 if aux_traj:
                     all_rigids.append(model_out['rigids'])
-
-                gt_trans_0 = sample_feats['rigids_t'][..., 4:]
-                pred_trans_0 = rigid_pred[..., 4:]
-                trans_pred_0 = diffuse_mask[..., None] * pred_trans_0 + fixed_mask[..., None] * gt_trans_0
                 
-                angles = model_out['angles']
                 if step_idx == len(reverse_steps)-1:
+                    angles = model_out['angles']
+                    gt_trans_0 = sample_feats['rigids_t'][..., 4:]
+                    pred_trans_0 = rigid_pred[..., 4:]
+                    trans_pred_0 = diffuse_mask[..., None] * pred_trans_0 + fixed_mask[..., None] * gt_trans_0
                     atom37_t = all_atom.compute_backbone_atom37(
-                        bb_rigids=rigids_t, 
+                        bb_rigids=current_rigid_obj, 
                         aatypes=sample_feats['aatype'],
                         torsions = angles
                         )[0]
                     all_bb_prots.append(atom37_t)
-        # 
+                
         inference_time = time.perf_counter() - t_start
         print(f"inference_time:{inference_time:.2f} | num_t:{num_t} | noise_scale:{noise_scale}")
-        # flip = lambda x: np.flip(np.stack(x), (0,))
-        flip = lambda x: torch.flip(torch.stack(x), dims=(0,))
-        all_bb_prots = flip(all_bb_prots)
-        all_rigids = flip(all_rigids)
+        
+        def safe_flip(x):
+            if len(x) > 0:
+                return torch.flip(torch.stack(x), dims=(0,))
+            return x 
+
+        all_bb_prots = safe_flip(all_bb_prots)
+        all_rigids = safe_flip(all_rigids)        
+        
         ret = {
-            'prot_traj': all_bb_prots, # with reverse
+            'prot_traj': all_bb_prots, 
             'rigid_traj': all_rigids
         }
         return ret
@@ -1181,17 +1196,14 @@ class Experiment:
         min_t=None,
         num_t=None,
         noise_scale=1.0,
+        executor=None,
     ):
         """Process one protein sequence and perform trajectory extrapolation."""
-        
-        # print(f"================pdb_names:{pdb_names}")
-
         # === Preparation ===
         protein_name = pdb_names[0]
         frame_time = self._model_conf.frame_time
         ref_number = self._model_conf.ref_number
         motion_number = self._model_conf.motion_number
-
         aatype = valid_feats["aatype"].cpu().numpy()
         sample_length = aatype.shape[-1]
         b_factors = np.tile((np.ones(sample_length) * 100)[:, None], (1, 37))
@@ -1199,9 +1211,6 @@ class Experiment:
         if os.path.exists(pdb_path):
             print(f"✅ {protein_name} already existed in: {pdb_path}")
             return 
-        
-        # print(f"DEBUG: rigids_t shape = {valid_feats['rigids_t'].shape}")
-        # print(f"DEBUG: node_repr shape = {valid_feats['node_repr'].shape}")
         
         # Save reference structure
         ref_all_atom_positions = valid_feats["ref_atom37_pos"][0].cpu().numpy()
@@ -1212,14 +1221,23 @@ class Experiment:
             no_indexing=True,
             b_factors=b_factors,
         )
-
         print(f"[Eval] Processing {protein_name}, length={extrapolation_time}")
-
         # === Initialize input ===
         atom_traj, rigid_traj = [], []
         valid_feats = self._prepare_init_feats(valid_feats, device, frame_time, sample_length)
         
-        # === Iterative inference ===
+        frame_time, L = valid_feats['res_mask'].shape
+
+        # pre-compute
+        all_start_rigids = self.diffuser.sample_ref(
+                n_samples=extrapolation_time * frame_time * L,
+                as_tensor_7=True,
+            )['rigids_t'].reshape(extrapolation_time, frame_time, L, 7).to(device)
+        reverse_steps = self.reverse_steps         
+        z_rot_all = torch.randn(len(reverse_steps),frame_time,L, 3,device=device)
+        z_trans_all = torch.randn(len(reverse_steps),frame_time,L, 3,device=device)
+        
+        # # === Iterative inference ===
         pbar = tqdm(range(extrapolation_time), desc=f"{protein_name}", ncols=80)
         
         for j in pbar:
@@ -1229,17 +1247,17 @@ class Experiment:
                 num_t=num_t,
                 min_t=min_t,
                 aux_traj=True,
-                noise_scale=noise_scale,
+                noise_scale=noise_scale, 
+                z_rot_all=z_rot_all,
+                z_trans_all=z_trans_all,
             )
-
             atom_pred = sample_out["prot_traj"][0]
             rigid_pred = sample_out["rigid_traj"][0]
-
             # Save the results
             atom_traj.append(atom_pred[-frame_time:])
             rigid_traj.append(rigid_pred[-frame_time:])
-
             # === Update reference state ===
+            valid_feats['rigids_t'] = all_start_rigids[j]
             valid_feats = self._update_ref_with_prediction(
                 valid_feats,
                 atom_pred,
@@ -1248,26 +1266,31 @@ class Experiment:
                 motion_number,
                 device,
             )
-
         # === Concatenate trajectory and save ===
-        # atom_traj = np.concatenate(atom_traj, axis=0)
-        # rigid_traj = np.concatenate(rigid_traj, axis=0)
-        
         atom_traj = torch.cat(atom_traj, dim=0)
         rigid_traj = torch.cat(rigid_traj, dim=0)
         if torch.is_tensor(atom_traj):
             atom_traj = atom_traj.detach().cpu().numpy()
         if torch.is_tensor(rigid_traj):
             rigid_traj = rigid_traj.detach().cpu().numpy()
-        
-        with nvtx_range("PDB_Writing_IO"):
+        if executor is not None:
+            executor.submit(
+                au.write_prot_to_pdb, 
+                prot_pos=atom_traj,
+                file_path=pdb_path,
+                aatype=aatype[0, 0],
+                no_indexing=True,
+                b_factors=b_factors
+            )
+        else:
             au.write_prot_to_pdb(
                 prot_pos=atom_traj,
                 file_path=pdb_path,
                 aatype=aatype[0, 0],
                 no_indexing=True,
-                b_factors=b_factors,
+                b_factors=b_factors
             )
+        
     def _prepare_init_feats(self, valid_feats, device, frame_time, sample_length):
         """Prepare initial features for inference."""
         res_mask = np.ones((frame_time, sample_length))
@@ -1303,78 +1326,23 @@ class Experiment:
                 # TODO maybe should support B!=1
 
         return init_feats
-
+    
     def _update_ref_with_prediction(self, valid_feats, atom_pred, rigid_pred, ref_number, motion_number, device, change_ref=False):
-        """Update reference features with newly predicted frames."""
         concat_rigids = torch.cat([
-            valid_feats["motion_rigids_0"].to(device),
-            valid_feats["ref_rigids_0"].to(device),
-            # torch.from_numpy(rigid_pred).to(device).to(valid_feats["motion_rigids_0"].dtype), #(rigid_pred if torch.is_tensor(rigid_pred) else torch.from_numpy(rigid_pred))
-            rigid_pred.to(device).to(valid_feats["motion_rigids_0"].dtype),
+            valid_feats["motion_rigids_0"],
+            valid_feats["ref_rigids_0"],
+            rigid_pred
         ], dim=0)
 
         concat_atoms = torch.cat([
-            valid_feats["motion_atom37_pos"].to(device),
-            valid_feats["ref_atom37_pos"].to(device),
-            # torch.from_numpy(atom_pred).to(device).to(valid_feats["motion_atom37_pos"].dtype),
-            atom_pred.to(device).to(valid_feats["motion_atom37_pos"].dtype),
+            valid_feats["motion_atom37_pos"],
+            valid_feats["ref_atom37_pos"],
+            atom_pred
         ], dim=0)
-        if change_ref:
-            # valid_feats["ref_rigids_0"] = concat_rigids[-ref_number:]#.unsqueeze(0)
-            # valid_feats["ref_atom37_pos"] = concat_atoms[-ref_number:]#.unsqueeze(0)
-            lddt_score = lddt_ca(
-                all_atom_positions=valid_feats["ref_atom37_pos"],
-                all_atom_pred_pos=concat_atoms[ref_number + motion_number :],
-                all_atom_mask=valid_feats['atom37_mask'],
-                per_residue=False
-            )
-            def compute_ca_clash_score_batch(atom_positions, atom_mask, clash_threshold=2.0):
-                CA_IDX = residue_constants.atom_order["CA"]
-                ca_pos = atom_positions[:, :, CA_IDX, :]
-                ca_mask = atom_mask[:, :, CA_IDX].bool()
-                diff = ca_pos.unsqueeze(2) - ca_pos.unsqueeze(1)
-                dist = torch.linalg.norm(diff, dim=-1)
-                T, N = ca_mask.shape
-                dist = dist + torch.eye(N, device=dist.device).unsqueeze(0) * 999.0
-                valid_pairs = ca_mask.unsqueeze(2) & ca_mask.unsqueeze(1)
-                clashes = (dist < clash_threshold) & valid_pairs
-                clash_atoms = clashes.any(dim=-1)
-                clash_ratio = clash_atoms.sum(dim=-1) / ca_mask.sum(dim=-1)
-                return clash_ratio
-            clash_ratio = compute_ca_clash_score_batch(
-                concat_atoms[ref_number + motion_number :],
-                valid_feats["atom37_mask"],
-                clash_threshold=2.0,
-            )
-            idx1 = torch.argsort(clash_ratio)
-            sorted_idx = idx1[torch.argsort(lddt_score[idx1])]
-            best_idx = sorted_idx[0].item()
-            if clash_ratio[best_idx] < 0.01:
-                valid_feats["ref_rigids_0"] = concat_rigids[ref_number + motion_number :][
-                    best_idx : best_idx + 1
-                ]#.unsqueeze(0)
-                valid_feats["ref_atom37_pos"] = concat_atoms[ref_number + motion_number :][
-                    best_idx : best_idx + 1
-                ]#.unsqueeze(0)
-                # select which ref to be
-                ic(f"change ref to {best_idx} with {concat_atoms[ref_number + motion_number :].shape}")
-            else:
-                ic("generated seg has clash keep the original reference")
 
-        valid_feats["motion_rigids_0"] = concat_rigids[-motion_number:]#.unsqueeze(0)
-        valid_feats["motion_atom37_pos"] = concat_atoms[-motion_number:]#.unsqueeze(0)
-
-        # 更新 ref rigids_t
-        ref_sample = self.diffuser.sample_ref(
-            n_samples=valid_feats["aatype"].shape[-1] * self._model_conf.frame_time,
-            as_tensor_7=True,
-        )
-        ref_sample["rigids_t"] = ref_sample["rigids_t"].reshape(
-            [self._model_conf.frame_time, valid_feats["aatype"].shape[-1], 7]
-            # [-1, self._model_conf.frame_time, valid_feats["aatype"].shape[-1], 7]
-        )
-        valid_feats["rigids_t"] = ref_sample["rigids_t"].to(device)
-
+        valid_feats["motion_rigids_0"] = concat_rigids[-motion_number:]
+        valid_feats["motion_atom37_pos"] = concat_atoms[-motion_number:]
+        
         return valid_feats
     
     def _update_best_model(self, mean_dict: dict, rot_trans_error_mean: dict) -> bool:
