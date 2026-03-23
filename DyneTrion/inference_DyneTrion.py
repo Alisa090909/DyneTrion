@@ -103,21 +103,21 @@ class Evaluator:
         # we need to call the MD simulation to get the data
         # maybe add some func in the dateset class
         
-        print("开始准备数据和预热...")
+        print("Preparing data and starting warmup...")
         test_dataset = self.create_dataset(is_random=self._conf.eval.random_sample)
         
         num_to_run = len(test_dataset)
-        print(f"本次计划推理蛋白数量: {num_to_run}")
+        print(f"Total proteins scheduled for inference: {num_to_run}")
         
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        # seq_len 最大的索引
+        # max_seq_len
         current_batch_df = test_dataset.csv.iloc[:num_to_run]
         max_idx_in_batch = current_batch_df['seq_len'].idxmax()
         max_len = current_batch_df['seq_len'].max()
         pdb_id_of_max = current_batch_df.loc[max_idx_in_batch, 'pdb_id']
         relative_idx = current_batch_df.index.get_loc(max_idx_in_batch)
 
-        print(f"==== 预热：使用本次批次中最长的蛋白 [ID: {pdb_id_of_max}, 长度: {max_len}] ====")
+        print(f"==== Warmup: Using protein with max sequence length [ID: {pdb_id_of_max}, Length: {max_len}] ====")
 
         # warmup 2 steps
         with torch.no_grad():
@@ -136,7 +136,7 @@ class Evaluator:
                                   )
             torch.cuda.synchronize()
             # torch.cuda.empty_cache() 
-        print("==== [Warmup] 预热成功，显存已锁定 ====")    
+        print("==== [Warmup] Complete. GPU memory successfully allocated. ====") 
         
         future = executor.submit(test_dataset._get_row, 0)    
 

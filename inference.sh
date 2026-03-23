@@ -12,7 +12,7 @@ test_data=datasets/inference/inference_data.csv
 max_protein_num=100
 train_step=400000 
 
-model_path=./dynamicPDB/DyneTrion/step_400000.pth
+model_path=step_400000.pth # Path to the model checkpoint file
 
 noise_scale=1.0
 save_root=${project_root}/inference_${TIMESTAMP}/
