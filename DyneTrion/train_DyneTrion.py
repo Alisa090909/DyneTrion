@@ -26,8 +26,6 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils import data
 import mdtraj as md
-from contextlib import contextmanager
-import torch.cuda.nvtx as nvtx
 
 import swanlab
 from tqdm import tqdm
@@ -43,8 +41,8 @@ from openfold.utils.loss import lddt_ca, torsion_angle_loss
 from src.data import DyneTrion_data_loader_dynamic
 from src.analysis import utils as au
 
-from src.data import se3_diffuser as se3_diffuser
-from src.data import all_atom as all_atom
+from src.data import se3_diffuser
+from src.data import all_atom
 
 from src.data import utils as du
 from src.experiments import utils as eu
@@ -1078,7 +1076,6 @@ class Experiment:
             align_metric_list.append((rot, trans))
             aligned = np.dot(pred_traj[frame_idx], rot) + trans
             aligned *= atom37_mask[frame_idx][..., None]  # apply mask
-            # align_sample_list.append(torch.from_numpy(aligned))
             align_sample_list.append(aligned)
 
         aligned_sample = torch.stack(align_sample_list)

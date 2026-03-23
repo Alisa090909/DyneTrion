@@ -16,10 +16,6 @@ from omegaconf import DictConfig
 from omegaconf import OmegaConf
 from torch.utils import data
 from typing import Dict
-from contextlib import contextmanager
-import torch.cuda.nvtx as nvtx
-import torch.cuda.profiler as profiler
-import concurrent.futures
 
 from src.data import DyneTrion_data_loader_dynamic
 from src.data import utils as du
@@ -100,27 +96,6 @@ class Evaluator:
             grouped=self._conf.eval.group,
         )
         return test_dataset
-    
-    def warmup_model(self, warmup_feats, device):
-        
-        print("==== [Warmup] 正在初始化计算图和显存池... ====")
-        
-        f_time, l_len = warmup_feats['res_mask'].shape
-        z_rot_all = torch.randn(100, f_time, l_len, 3, device=self.device)
-        z_trans_all = torch.randn(100, f_time, l_len, 3, device=self.device)
-        with torch.no_grad():
-            self.inference_fn(
-                warmup_feats, 
-                num_t=2, 
-                min_t=0.01, 
-                aux_traj=True, 
-                # precomputed_noises=warmup_noise
-                z_rot_all=z_rot_all,
-                z_trans_all=z_trans_all
-            )
-            torch.cuda.synchronize()
-            # torch.cuda.empty_cache() 
-        print("==== [Warmup] 预热成功，显存已锁定 ====")
 
     def start_evaluation(self):
         # define data process

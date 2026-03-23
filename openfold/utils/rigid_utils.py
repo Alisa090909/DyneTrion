@@ -219,8 +219,6 @@ def rot_to_quat(
 
     k = (1./3.) * torch.stack([torch.stack(t, dim=-1) for t in k], dim=-2)
 
-    # _, vectors = torch.linalg.eigh(k.cpu())
-    # return vectors[..., -1].to(k.device)
     _, vectors = torch.linalg.eigh(k)
     return vectors[..., -1]
 
@@ -254,7 +252,6 @@ _QUAT_MULTIPLY_BY_VEC = torch.tensor(_QUAT_MULTIPLY_BY_VEC, dtype=torch.float32)
 
 def quat_multiply(quat1, quat2):
     """Multiply a quaternion by another quaternion."""
-    # mat = quat1.new_tensor(_QUAT_MULTIPLY)
     mat = _QUAT_MULTIPLY.to(device=quat1.device, dtype=quat1.dtype)
     reshaped_mat = mat.view((1,) * len(quat1.shape[:-1]) + mat.shape)
     return torch.sum(
@@ -267,7 +264,6 @@ def quat_multiply(quat1, quat2):
 
 def quat_multiply_by_vec(quat, vec):
     """Multiply a quaternion by a pure-vector quaternion."""
-    # mat = quat.new_tensor(_QUAT_MULTIPLY_BY_VEC)
     mat = _QUAT_MULTIPLY_BY_VEC.to(device=quat.device, dtype=quat.dtype)
     reshaped_mat = mat.view((1,) * len(quat.shape[:-1]) + mat.shape)
     return torch.sum(
@@ -1041,7 +1037,6 @@ class Rigid:
         return self._trans
     
     def get_quats(self) -> torch.Tensor:
-        """快捷获取四元数张量"""
         return self._rots.get_quats()
 
     def compose_q_update_vec(self, 

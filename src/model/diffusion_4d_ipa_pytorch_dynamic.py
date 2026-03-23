@@ -12,7 +12,6 @@ from src.data import all_atom
 import torch.nn.functional as F
 import inspect
 import sys
-import torch.cuda.nvtx as nvtx
 
 import torch.utils.checkpoint as cp
 

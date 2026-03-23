@@ -334,7 +334,6 @@ class SO3Diffuser:
         sigma_t = torch.log(t * exp_max + (1 - t) * exp_min)
         g_t = torch.sqrt(2 * (exp_max - exp_min) * sigma_t / torch.exp(sigma_t))
         
-        # z = noise_scale * torch.randn_like(score_t)
         perturb = (g_t ** 2) * score_t * dt + g_t * sqrt_dt * z
 
         if mask is not None: perturb *= mask[..., None]

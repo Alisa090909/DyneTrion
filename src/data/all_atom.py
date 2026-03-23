@@ -197,7 +197,7 @@ def compute_backbone_atom37(bb_rigids,aatypes, torsions):
 
 def frames_to_atom37_pos(r: Rigid, aatype: torch.Tensor):
     """
-    使用索引查找代替 one_hot 乘法。
+    index instead of one_hot multiplication
     """
     group_idx = GROUP_IDX_37[aatype] 
 

@@ -150,7 +150,7 @@ class R3Diffuser:
         return x_t_1 / self._scaling_t
 
     def conditional_var(self, t, use_torch=True):
-        """xt|x0 的条件方差"""
+        """Conditional variance of xt|x0 """
         return 1.0 - torch.exp(-self.marginal_b_t(t))
 
     def score(self, x_t, x_0, t, use_torch=False, scale=False):

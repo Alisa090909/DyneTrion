@@ -1,7 +1,7 @@
 """SE(3) diffusion methods."""
 import numpy as np
-from src.data import so3_diffuser as so3_diffuser
-from src.data import r3_diffuser as r3_diffuser
+from src.data import so3_diffuser
+from src.data import r3_diffuser
 from scipy.spatial.transform import Rotation
 from openfold.utils import rigid_utils as ru
 from src.data import utils as du
